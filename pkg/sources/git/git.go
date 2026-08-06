@@ -38,7 +38,15 @@ import (
 	"github.com/trufflesecurity/trufflehog/v3/pkg/sources"
 )
 
-const SourceType = sourcespb.SourceType_SOURCE_TYPE_GIT
+const (
+	SourceType = sourcespb.SourceType_SOURCE_TYPE_GIT
+	// maxCloneAttempts is the total number of times a clone is attempted when
+	// each failure is classified as a transient network error.
+	maxCloneAttempts = 3
+	// cloneRetryBackoff is the base wait between clone attempts; it is
+	// multiplied by the number of failed attempts so far.
+	cloneRetryBackoff = 5 * time.Second
+)
 
 type Source struct {
 	name     string
@@ -474,38 +482,86 @@ type cloneParams struct {
 // infrastructure, ensuring that any encountered errors trigger a cleanup of resources.
 // The core cloning logic is delegated to a nested function, which returns errors to the
 // outer function for centralized error handling and cleanup.
+//
+// Failures classified as transient network errors (e.g. a connection reset
+// mid-transfer) are retried up to maxCloneAttempts times, each attempt
+// starting from a fresh clone directory. All other failures, including clone
+// timeouts (see feature.GitCloneTimeoutDuration), are returned immediately.
 func CloneRepo(ctx context.Context, userInfo *url.Userinfo, gitURL string, clonePath string, authInUrl bool, args ...string) (string, *git.Repository, error) {
-	var path string
-	var err error
-
-	// If --clone-path is set, create a subdirectory <clonePath>/trufflehog-<repo-name> with permissions 0755.
-	if clonePath != "" {
-		path = filepath.Join(clonePath, "trufflehog-"+strings.TrimSuffix(filepath.Base(gitURL), gitDirName))
-		if err = os.MkdirAll(path, 0755); err != nil {
-			return "", nil, fmt.Errorf("failed to create clone path %s: %w", clonePath, err)
-		}
-	} else {
-		// otherwise, create a temporary directory in the system temp path.
-		path, err = cleantemp.MkdirTemp()
-		if err != nil {
-			return "", nil, fmt.Errorf("failed to create temporary clone path: %w", err)
-		}
-	}
-
 	timeout := time.Duration(feature.GitCloneTimeoutDuration.Load())
 
-	repo, err := executeClone(ctx, cloneParams{userInfo, gitURL, args, path, authInUrl, timeout})
-	if err != nil {
-		// DO NOT FORGET TO CLEAN UP THE CLONE PATH HERE!!
-		// If we don't, we'll end up with a bunch of orphaned directories in the temp dir.
-		CleanOnError(&err, path)
+	var path string
+	var repo *git.Repository
+	var err error
+	for attempt := 1; attempt <= maxCloneAttempts; attempt++ {
+		// Each attempt starts from a fresh clone directory.
+		path, err = createClonePath(gitURL, clonePath)
+		if err != nil {
+			return "", nil, err
+		}
 
-		// Note: We don't need to record the clone failure here as it's already
-		// recorded in executeClone when the error occurs
-		return "", nil, err
+		repo, err = executeClone(ctx, cloneParams{userInfo, gitURL, args, path, authInUrl, timeout})
+		if err == nil {
+			return path, repo, nil
+		}
+
+		if attempt >= maxCloneAttempts || !isRetryableCloneError(err) || common.IsDone(ctx) {
+			// DO NOT FORGET TO CLEAN UP THE CLONE PATH HERE!!
+			// If we don't, we'll end up with a bunch of orphaned directories in the temp dir.
+			CleanOnError(&err, path)
+
+			// Note: We don't need to record the clone failure here as it's already
+			// recorded in executeClone when the error occurs
+			return "", nil, err
+		}
+
+		// Discard the partial clone; the next iteration recreates a fresh directory.
+		if rmErr := os.RemoveAll(path); rmErr != nil {
+			return "", nil, fmt.Errorf("failed to clean clone path for retry: %w (original clone error: %w)", rmErr, err)
+		}
+
+		ctx.Logger().Info("git clone interrupted by network error; retrying",
+			"attempt", attempt,
+			"max_attempts", maxCloneAttempts,
+			"error", err.Error(),
+		)
+		select {
+		case <-ctx.Done():
+			return "", nil, ctx.Err()
+		case <-time.After(cloneRetryBackoff * time.Duration(attempt)):
+		}
 	}
 
-	return path, repo, nil
+	return "", nil, err
+}
+
+// isRetryableCloneError reports whether a clone failure looks like a
+// transient network interruption (e.g. a connection reset mid-transfer)
+// rather than a permanent condition like an auth or permission error.
+func isRetryableCloneError(err error) bool {
+	return err != nil && ClassifyCloneError(err.Error()) == cloneFailureNetwork
+}
+
+// createClonePath creates the directory a repository will be cloned into and
+// returns its path. When clonePath is set (the --clone-path flag), the
+// directory is <clonePath>/trufflehog-<repo-name> with permissions 0755;
+// otherwise a fresh temporary directory (0700, per os.MkdirTemp) is created
+// in the system temp path. It is called both before the first clone attempt
+// and to replace the directory between retries.
+func createClonePath(gitURL, clonePath string) (string, error) {
+	if clonePath == "" {
+		path, err := cleantemp.MkdirTemp()
+		if err != nil {
+			return "", fmt.Errorf("failed to create temporary clone path: %w", err)
+		}
+		return path, nil
+	}
+
+	path := filepath.Join(clonePath, "trufflehog-"+strings.TrimSuffix(filepath.Base(gitURL), gitDirName))
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return "", fmt.Errorf("failed to create clone path %s: %w", clonePath, err)
+	}
+	return path, nil
 }
 
 // executeClone prepares the Git URL, constructs, and executes the git clone command using the provided
@@ -677,6 +733,50 @@ func (s *Git) CommitsScanned() uint64 {
 }
 
 const gitDirName = ".git"
+
+// resolveGitDir resolves the actual git directory path for a repository.
+// In a regular repository, .git is a directory containing the git data.
+// In a git worktree, .git is a file containing a "gitdir: <path>" reference
+// to the actual git directory location.
+// This function handles both cases and returns the path to the actual git directory.
+func resolveGitDir(repoPath string) (string, error) {
+	gitPath := filepath.Join(repoPath, gitDirName)
+
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat .git: %w", err)
+	}
+
+	// If .git is a directory, return it directly
+	if info.IsDir() {
+		return gitPath, nil
+	}
+
+	// .git is a file (worktree) - read and parse the gitdir reference
+	content, err := os.ReadFile(gitPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read .git file: %w", err)
+	}
+
+	// Parse "gitdir: <path>" format
+	line := strings.TrimSpace(string(content))
+	const gitdirPrefix = "gitdir: "
+	if !strings.HasPrefix(line, gitdirPrefix) {
+		return "", fmt.Errorf("invalid .git file format: expected 'gitdir: <path>', got %q", line)
+	}
+
+	gitdirPath := strings.TrimPrefix(line, gitdirPrefix)
+
+	// The path may be relative to the worktree directory
+	if !filepath.IsAbs(gitdirPath) {
+		gitdirPath = filepath.Join(repoPath, gitdirPath)
+	}
+
+	// Clean the path to resolve any ".." components
+	gitdirPath = filepath.Clean(gitdirPath)
+
+	return gitdirPath, nil
+}
 
 // getGitDir returns the likely path of the ".git" directory.
 // If the repository is bare, it will be at the top-level; otherwise, it
@@ -975,7 +1075,18 @@ func (s *Git) gitChunk(ctx context.Context, diff *gitparse.Diff, fileName, email
 		}
 	}
 	if err := originalChunk.Err(); err != nil {
-		ctx.Logger().Error(err, "error scanning chunk", "filename", fileName, "commit", hash, "file", diff.PathB)
+		// A single diff line exceeding maxScanTokenSize (e.g. minified JS or a
+		// base64 blob) is an expected condition for pathological files, not a
+		// failure. bufio.Scanner stops after this line, so the remainder of the
+		// diff is not scanned; log at a lower level to keep it out of the error
+		// stream while still recording that content was truncated. Genuine reader
+		// errors are still surfaced at ERROR.
+		if errors.Is(err, bufio.ErrTooLong) {
+			ctx.Logger().V(2).Info("skipping oversize diff line; remainder of file not scanned",
+				"filename", fileName, "commit", hash, "file", diff.PathB, "max_line_bytes", maxScanTokenSize)
+		} else {
+			ctx.Logger().Error(err, "error scanning chunk", "filename", fileName, "commit", hash, "file", diff.PathB)
+		}
 	}
 	// Send anything still in the new chunk buffer
 	if newChunkBuffer.Len() > 0 {
@@ -1428,8 +1539,13 @@ func PrepareRepo(ctx context.Context, uriString, clonePath string, trustLocalGit
 				// Note: To scan **un**staged changes in the future, we'd need to set core.worktree to the original path.
 				uriPath := normalizedURI.Path
 
-				originalIndexPath := filepath.Join(uriPath, gitDirName, "index")
+				// Resolve the actual git directory (handles both regular repos and worktrees)
+				originalGitDir, err := resolveGitDir(uriPath)
+				if err != nil {
+					return path, remote, fmt.Errorf("failed to resolve git directory: %w", err)
+				}
 
+				originalIndexPath := filepath.Join(originalGitDir, "index")
 				clonedIndexPath := filepath.Join(path, gitDirName, "index")
 
 				indexData, err := os.ReadFile(originalIndexPath)
@@ -1438,6 +1554,24 @@ func PrepareRepo(ctx context.Context, uriString, clonePath string, trustLocalGit
 				}
 				if err := os.WriteFile(clonedIndexPath, indexData, 0644); err != nil {
 					return path, remote, fmt.Errorf("failed to write index file: %w", err)
+				}
+
+				// Add the source object store as an alternate so staged blobs are accessible.
+				// git clone with file:// only transfers reachable objects; staged blobs must
+				// be reached via the original object store.
+				// For worktrees, the commondir file points to the main repo's git dir
+				// which holds the actual shared object store.
+				sourceObjectsPath := filepath.Join(originalGitDir, "objects")
+				if commondirData, err := os.ReadFile(filepath.Join(originalGitDir, "commondir")); err == nil {
+					commondir := strings.TrimSpace(string(commondirData))
+					if !filepath.IsAbs(commondir) {
+						commondir = filepath.Join(originalGitDir, commondir)
+					}
+					sourceObjectsPath = filepath.Join(filepath.Clean(commondir), "objects")
+				}
+				alternatesPath := filepath.Join(path, gitDirName, "objects", "info", "alternates")
+				if err := os.MkdirAll(filepath.Dir(alternatesPath), 0755); err == nil {
+					_ = os.WriteFile(alternatesPath, []byte(sourceObjectsPath+"\n"), 0644)
 				}
 			}
 		}
