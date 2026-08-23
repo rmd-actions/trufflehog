@@ -366,6 +366,51 @@ func TestAddReposByApp(t *testing.T) {
 	assert.True(t, gock.IsDone())
 }
 
+// TestAppConnector_EnterpriseBaseURL verifies that GitHub App authentication
+// correctly sets the BaseURL on the internal AppsTransport for token refresh.
+// This is critical for GitHub Enterprise Server and GHEC with Data Residency.
+// Without this fix, token refresh requests would go to api.github.com instead
+// of the configured enterprise endpoint.
+func TestAppConnector_EnterpriseBaseURL(t *testing.T) {
+	privateKey := createPrivateKey()
+	enterpriseEndpoint := "https://api.example.ghe.com"
+
+	connector, err := NewAppConnector(
+		context.Background(),
+		enterpriseEndpoint,
+		&credentialspb.GitHubApp{
+			PrivateKey:     privateKey,
+			InstallationId: "1337",
+			AppId:          "4141",
+		})
+	require.NoError(t, err)
+
+	appConn, ok := connector.(*appConnector)
+	require.True(t, ok, "connector should be an appConnector")
+
+	// Get the HTTP client's transport, which should be a ghinstallation.Transport
+	transport := appConn.APIClient().Client().Transport
+
+	// Use reflection to access the Transport's BaseURL field
+	transportVal := reflect.ValueOf(transport).Elem()
+	baseURLField := transportVal.FieldByName("BaseURL")
+	require.True(t, baseURLField.IsValid(), "Transport should have a BaseURL field")
+	assert.Equal(t, enterpriseEndpoint, baseURLField.String(),
+		"Transport.BaseURL should be set to enterprise endpoint")
+
+	// Use reflection to access the internal appsTransport and verify its BaseURL
+	// This is the critical check - the internal AppsTransport is used for token refresh
+	appsTransportField := transportVal.FieldByName("appsTransport")
+	require.True(t, appsTransportField.IsValid(), "Transport should have an appsTransport field")
+
+	// Access the BaseURL of the internal AppsTransport
+	appsTransportVal := appsTransportField.Elem()
+	appsBaseURLField := appsTransportVal.FieldByName("BaseURL")
+	require.True(t, appsBaseURLField.IsValid(), "AppsTransport should have a BaseURL field")
+	assert.Equal(t, enterpriseEndpoint, appsBaseURLField.String(),
+		"AppsTransport.BaseURL should be set to enterprise endpoint")
+}
+
 func TestAddOrgsByUser(t *testing.T) {
 	defer gock.Off()
 
@@ -1380,7 +1425,12 @@ func TestMapExplicitReposToInstallationsRejectsHostMismatch(t *testing.T) {
 	assert.Contains(t, err.Error(), "configured repos were not found")
 }
 
-func TestMapExplicitReposToInstallationsRejectsRepoMissingFromInstallationList(t *testing.T) {
+// A repo absent from every installation listing but readable with the
+// default installation token (e.g. a public repo, or one the listing missed)
+// maps to the default installation instead of failing the scan. Repos the
+// default token cannot read are still rejected (see the preceding test and
+// TestScanAllInstallationsInaccessibleRepoStillFailsMapping).
+func TestMapExplicitReposToInstallationsFallsBackToDefaultForReadableRepo(t *testing.T) {
 	privateKey := createPrivateKey()
 	const repoURL = "https://github.com/other-org/repo.git"
 
@@ -1415,8 +1465,12 @@ func TestMapExplicitReposToInstallationsRejectsRepoMissingFromInstallationList(t
 		},
 	})
 	err := s.Init(context.Background(), "test - github", 0, 1337, false, conn, 1)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "configured repos were not found")
+	require.NoError(t, err)
+
+	connector := s.connector.(*appConnector)
+	installationID, mapped := connector.installationIDForRepo(repoURL)
+	require.True(t, mapped)
+	assert.Equal(t, int64(1337), installationID)
 }
 
 func TestMapExplicitReposToInstallationsMapsWikiRepoURL(t *testing.T) {
@@ -1679,6 +1733,136 @@ func TestScanAllInstallationsMapsUnitBeforeMetadataFetch(t *testing.T) {
 	installationID, mapped := connector.installationIDForRepo("https://github.com/other-org/repo.git")
 	assert.True(t, mapped)
 	assert.Equal(t, int64(2448), installationID)
+}
+
+// Regression test for member personal repos under scan_all_installations
+// (INT-789): they belong to no app installation, so the mapping must fall
+// back to the default installation when the API confirms the repo is
+// readable, both at chunk time and at enumeration time.
+func TestScanAllInstallationsMemberPersonalRepoFallsBackToDefaultInstallation(t *testing.T) {
+	privateKey := createPrivateKey()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/app/installations/") && strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			parts := strings.Split(r.URL.Path, "/")
+			installID := parts[len(parts)-2]
+			_, _ = fmt.Fprintf(w, `{"token":"token-%s","expires_at":"2099-01-01T00:00:00Z"}`, installID)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/app/installations"):
+			_, _ = w.Write([]byte(`[
+				{"id":1337,"account":{"login":"test-org","type":"Organization"}},
+				{"id":2448,"account":{"login":"other-org","type":"Organization"}}
+			]`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/installation/repositories"):
+			// Installations only ever contain org-owned repos.
+			auth := r.Header.Get("Authorization")
+			switch {
+			case strings.Contains(auth, "token-1337"):
+				_, _ = w.Write([]byte(`{"total_count":1,"repositories":[
+					{"name":"backend","full_name":"test-org/backend","clone_url":"https://github.com/test-org/backend.git","owner":{"login":"test-org","type":"Organization"},"size":1}
+				]}`))
+			case strings.Contains(auth, "token-2448"):
+				_, _ = w.Write([]byte(`{"total_count":0,"repositories":[]}`))
+			default:
+				http.Error(w, "unexpected installation token", http.StatusUnauthorized)
+			}
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/repos/alice/dns-data"):
+			// The member's personal repo exists and is public: any valid
+			// token can read it, mirroring real GitHub behavior.
+			_, _ = w.Write([]byte(`{"name":"dns-data","full_name":"alice/dns-data","clone_url":"https://github.com/alice/dns-data.git","owner":{"login":"alice","type":"User"},"private":false,"size":1}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/users/alice/repos"):
+			_, _ = w.Write([]byte(`[{"name":"dns-data","full_name":"alice/dns-data","clone_url":"https://github.com/alice/dns-data.git","owner":{"login":"alice","type":"User"},"private":false,"size":1}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	s, conn := createTestSource(&sourcespb.GitHub{
+		Endpoint:             server.URL,
+		ScanAllInstallations: true,
+		ScanUsers:            true,
+		Credential: &sourcespb.GitHub_GithubApp{
+			GithubApp: &credentialspb.GitHubApp{
+				PrivateKey:     privateKey,
+				InstallationId: "1337",
+				AppId:          "4141",
+			},
+		},
+	})
+	require.NoError(t, s.Init(context.Background(), "test - github", 0, 1337, false, conn, 1))
+
+	// The org-owned repo maps to its owning installation.
+	connector := s.connector.(*appConnector)
+	err := s.mapReposToInstallations(context.Background(), connector, []string{"https://github.com/test-org/backend.git"})
+	require.NoError(t, err)
+
+	// The member's public personal repo is in no installation, but the API
+	// confirms it is accessible, so it maps to the default installation.
+	err = s.mapReposToInstallations(context.Background(), connector, []string{"https://github.com/alice/dns-data.git"})
+	require.NoError(t, err)
+
+	installationID, mapped := connector.installationIDForRepo("https://github.com/alice/dns-data.git")
+	require.True(t, mapped)
+	require.Equal(t, int64(1337), installationID)
+
+	// Enumeration must map member repos up front so same-process ChunkUnit
+	// short-circuits without any mapping API calls.
+	connector.mu.Lock()
+	delete(connector.repoInstallationMap, "https://github.com/alice/dns-data.git")
+	connector.mu.Unlock()
+
+	require.NoError(t, s.getReposByUser(context.Background(), "alice", false, noopReporter()))
+	installationID, mapped = connector.installationIDForRepo("https://github.com/alice/dns-data.git")
+	require.True(t, mapped)
+	require.Equal(t, int64(1337), installationID)
+}
+
+// Repos that no installation owns AND the default installation token cannot
+// read must still fail the mapping: the accessibility fallback must not turn
+// the check fail-open.
+func TestScanAllInstallationsInaccessibleRepoStillFailsMapping(t *testing.T) {
+	privateKey := createPrivateKey()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/app/installations/") && strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			parts := strings.Split(r.URL.Path, "/")
+			installID := parts[len(parts)-2]
+			_, _ = fmt.Fprintf(w, `{"token":"token-%s","expires_at":"2099-01-01T00:00:00Z"}`, installID)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/app/installations"):
+			_, _ = w.Write([]byte(`[{"id":1337,"account":{"login":"test-org","type":"Organization"}}]`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/installation/repositories"):
+			_, _ = w.Write([]byte(`{"total_count":0,"repositories":[]}`))
+		default:
+			// /repos/... lookups 404: repo is private/nonexistent for
+			// every installation token.
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	s, conn := createTestSource(&sourcespb.GitHub{
+		Endpoint:             server.URL,
+		ScanAllInstallations: true,
+		Credential: &sourcespb.GitHub_GithubApp{
+			GithubApp: &credentialspb.GitHubApp{
+				PrivateKey:     privateKey,
+				InstallationId: "1337",
+				AppId:          "4141",
+			},
+		},
+	})
+	require.NoError(t, s.Init(context.Background(), "test - github", 0, 1337, false, conn, 1))
+
+	connector := s.connector.(*appConnector)
+	err := s.mapReposToInstallations(context.Background(), connector, []string{"https://github.com/ghost/private-repo.git"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "configured repos were not found in any GitHub App installation")
 }
 
 func TestEnumerateAllInstallationReposReportsInstallationErrors(t *testing.T) {
@@ -2429,5 +2613,351 @@ func TestExtractRepoNameFromURL(t *testing.T) {
 			result := extractRepoNameFromUrl(tt.url)
 			assert.Equal(t, tt.expected, result)
 		})
+	}
+}
+
+func TestSource_ExcludeArchivedRepositories(t *testing.T) {
+	tests := []struct {
+		name            string
+		excludeArchived bool
+		reposJSON       string
+		wantRepoCount   int
+		wantRepos       []string
+	}{
+		{
+			name:            "exclude archived repos when flag is true",
+			excludeArchived: true,
+			reposJSON: `[
+				{"full_name": "test-org/active-repo", "clone_url": "https://github.com/test-org/active-repo.git", "size": 1, "archived": false},
+				{"full_name": "test-org/archived-repo", "clone_url": "https://github.com/test-org/archived-repo.git", "size": 1, "archived": true},
+				{"full_name": "test-org/another-active", "clone_url": "https://github.com/test-org/another-active.git", "size": 1, "archived": false}
+			]`,
+			wantRepoCount: 2, // Only non-archived
+			wantRepos:     []string{"test-org/active-repo", "test-org/another-active"},
+		},
+		{
+			name:            "include archived repos when flag is false",
+			excludeArchived: false,
+			reposJSON: `[
+				{"full_name": "test-org/active-repo", "clone_url": "https://github.com/test-org/active-repo.git", "size": 1, "archived": false},
+				{"full_name": "test-org/archived-repo", "clone_url": "https://github.com/test-org/archived-repo.git", "size": 1, "archived": true},
+				{"full_name": "test-org/another-active", "clone_url": "https://github.com/test-org/another-active.git", "size": 1, "archived": false}
+			]`,
+			wantRepoCount: 3, // All repos
+			wantRepos:     []string{"test-org/active-repo", "test-org/archived-repo", "test-org/another-active"},
+		},
+		{
+			name:            "handle all archived repos",
+			excludeArchived: true,
+			reposJSON: `[
+				{"full_name": "test-org/archived-1", "clone_url": "https://github.com/test-org/archived-1.git", "size": 1, "archived": true},
+				{"full_name": "test-org/archived-2", "clone_url": "https://github.com/test-org/archived-2.git", "size": 1, "archived": true}
+			]`,
+			wantRepoCount: 0, // None included
+			wantRepos:     []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer gock.Off()
+
+			gock.New("https://api.github.com").
+				Get("/orgs/test-org/repos").
+				Reply(200).
+				JSON(tt.reposJSON)
+
+			s := initTestSource(&sourcespb.GitHub{
+				Credential: &sourcespb.GitHub_Token{
+					Token: "test-token",
+				},
+				ExcludeArchived: tt.excludeArchived,
+			})
+
+			err := s.getReposByOrg(context.Background(), "test-org", noopReporter())
+			assert.Nil(t, err)
+			assert.Equal(t, tt.wantRepoCount, s.filteredRepoCache.Count())
+
+			// Verify expected repos are in cache
+			for _, repo := range tt.wantRepos {
+				ok := s.filteredRepoCache.Exists(repo)
+				assert.True(t, ok, "expected repo %s to be in cache", repo)
+			}
+
+			// Verify archived repos are NOT in cache when excluding
+			if tt.excludeArchived {
+				allRepos := []string{"test-org/archived-repo", "test-org/archived-1", "test-org/archived-2"}
+				for _, repo := range allRepos {
+					if !slices.Contains(tt.wantRepos, repo) {
+						ok := s.filteredRepoCache.Exists(repo)
+						assert.False(t, ok, "archived repo %s should not be in cache when excluding", repo)
+					}
+				}
+			}
+
+			assert.False(t, gock.HasUnmatchedRequest())
+			assert.True(t, gock.IsDone())
+		})
+	}
+}
+
+func TestSource_ExcludeArchivedForkInteraction(t *testing.T) {
+	tests := []struct {
+		name            string
+		includeForks    bool
+		excludeArchived bool
+		reposJSON       string
+		wantRepoCount   int
+		wantRepos       []string
+		notWantRepos    []string
+	}{
+		{
+			name:            "fork+archived skipped when forks included and archived excluded",
+			includeForks:    true,
+			excludeArchived: true,
+			reposJSON: `[
+				{"full_name": "test-org/active", "clone_url": "https://github.com/test-org/active.git", "size": 1, "archived": false, "fork": false},
+				{"full_name": "test-org/fork-active", "clone_url": "https://github.com/test-org/fork-active.git", "size": 1, "archived": false, "fork": true},
+				{"full_name": "test-org/fork-archived", "clone_url": "https://github.com/test-org/fork-archived.git", "size": 1, "archived": true, "fork": true}
+			]`,
+			wantRepoCount: 2,
+			wantRepos:     []string{"test-org/active", "test-org/fork-active"},
+			notWantRepos:  []string{"test-org/fork-archived"},
+		},
+		{
+			name:            "fork+archived included when archived allowed",
+			includeForks:    true,
+			excludeArchived: false,
+			reposJSON: `[
+				{"full_name": "test-org/active", "clone_url": "https://github.com/test-org/active.git", "size": 1, "archived": false, "fork": false},
+				{"full_name": "test-org/fork-archived", "clone_url": "https://github.com/test-org/fork-archived.git", "size": 1, "archived": true, "fork": true}
+			]`,
+			wantRepoCount: 2,
+			wantRepos:     []string{"test-org/active", "test-org/fork-archived"},
+		},
+		{
+			name:            "fork+archived dropped by fork filter when forks excluded",
+			includeForks:    false,
+			excludeArchived: true,
+			reposJSON: `[
+				{"full_name": "test-org/active", "clone_url": "https://github.com/test-org/active.git", "size": 1, "archived": false, "fork": false},
+				{"full_name": "test-org/fork-archived", "clone_url": "https://github.com/test-org/fork-archived.git", "size": 1, "archived": true, "fork": true}
+			]`,
+			wantRepoCount: 1,
+			wantRepos:     []string{"test-org/active"},
+			notWantRepos:  []string{"test-org/fork-archived"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer gock.Off()
+
+			gock.New("https://api.github.com").
+				Get("/orgs/test-org/repos").
+				Reply(200).
+				JSON(tt.reposJSON)
+
+			s := initTestSource(&sourcespb.GitHub{
+				Credential: &sourcespb.GitHub_Token{
+					Token: "test-token",
+				},
+				IncludeForks:    tt.includeForks,
+				ExcludeArchived: tt.excludeArchived,
+			})
+
+			err := s.getReposByOrg(context.Background(), "test-org", noopReporter())
+			assert.Nil(t, err)
+			assert.Equal(t, tt.wantRepoCount, s.filteredRepoCache.Count())
+
+			for _, repo := range tt.wantRepos {
+				assert.True(t, s.filteredRepoCache.Exists(repo), "expected repo %s to be in cache", repo)
+			}
+			for _, repo := range tt.notWantRepos {
+				assert.False(t, s.filteredRepoCache.Exists(repo), "repo %s should not be in cache", repo)
+			}
+
+			assert.False(t, gock.HasUnmatchedRequest())
+			assert.True(t, gock.IsDone())
+		})
+	}
+}
+
+func TestIsGHECloud(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		want     bool
+	}{
+		// GHE.com endpoints — should return true
+		{"api subdomain", "https://api.company.ghe.com", true},
+		{"web subdomain", "https://company.ghe.com", true},
+		{"api subdomain trailing slash", "https://api.company.ghe.com/", true},
+		{"web subdomain trailing slash", "https://company.ghe.com/", true},
+		{"uppercase", "https://API.company.GHE.COM", true},
+		{"mixed case", "https://Api.company.Ghe.Com/", true},
+		{"deep subdomain", "https://api.team.company.ghe.com", true},
+
+		// GHES endpoints — should return false
+		{"ghes custom domain", "https://github.mycompany.com", false},
+		{"ghes with path", "https://github.mycompany.com/api/v3", false},
+		{"ghes internal", "https://github.internal.corp.com", false},
+
+		// github.com — should return false
+		{"cloud api", "https://api.github.com", false},
+		{"cloud web", "https://github.com", false},
+
+		// Edge cases — should return false
+		{"empty string", "", false},
+		{"localhost", "http://localhost:8080", false},
+		{"malicious suffix", "https://notghe.com", false},
+		{"partial match", "https://api.fakeghe.com.evil.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isGHECloud(tt.endpoint)
+			if got != tt.want {
+				t.Errorf("isGHECloud(%q) = %v, want %v", tt.endpoint, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeGHECloudAPIEndpoint(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "web URL to API URL",
+			input: "https://company.ghe.com",
+			want:  "https://api.company.ghe.com/",
+		},
+		{
+			name:  "web URL with trailing slash",
+			input: "https://company.ghe.com/",
+			want:  "https://api.company.ghe.com/",
+		},
+		{
+			name:  "api URL already correct",
+			input: "https://api.company.ghe.com",
+			want:  "https://api.company.ghe.com/",
+		},
+		{
+			name:  "api URL with trailing slash",
+			input: "https://api.company.ghe.com/",
+			want:  "https://api.company.ghe.com/",
+		},
+		{
+			name:  "preserves port",
+			input: "http://company.ghe.com:8080",
+			want:  "http://api.company.ghe.com:8080/",
+		},
+		{
+			name:  "api with port",
+			input: "http://api.company.ghe.com:8080",
+			want:  "http://api.company.ghe.com:8080/",
+		},
+		{
+			name:  "strips path",
+			input: "https://company.ghe.com/some/path",
+			want:  "https://api.company.ghe.com/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeGHECloudAPIEndpoint(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("normalizeGHECloudAPIEndpoint(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("normalizeGHECloudAPIEndpoint(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCreateAPIClient_GHECloud_NoAPIV3(t *testing.T) {
+	// The most critical test: GHE.com clients must NOT have /api/v3/ in their BaseURL.
+	endpoints := []string{
+		"https://api.company.ghe.com",
+		"https://company.ghe.com",
+		"https://api.company.ghe.com/",
+		"https://company.ghe.com/",
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint, func(t *testing.T) {
+			client, err := createGHECloudClient(http.DefaultClient, endpoint)
+			if err != nil {
+				t.Fatalf("createGHECloudClient(%q) unexpected error: %v", endpoint, err)
+			}
+
+			baseURL := client.BaseURL.String()
+
+			// Must NOT contain /api/v3
+			if strings.Contains(baseURL, "/api/v3") {
+				t.Errorf("GHE.com client BaseURL must not contain /api/v3/, got: %s", baseURL)
+			}
+
+			// Must point to api.company.ghe.com
+			if client.BaseURL.Hostname() != "api.company.ghe.com" {
+				t.Errorf("expected hostname api.company.ghe.com, got: %s", client.BaseURL.Hostname())
+			}
+
+			// Must have trailing slash
+			if !strings.HasSuffix(baseURL, "/") {
+				t.Errorf("BaseURL must have trailing slash, got: %s", baseURL)
+			}
+		})
+	}
+}
+
+func TestCreateGraphqlClient_GHECloud(t *testing.T) {
+	// GHE.com GraphQL should be at /graphql, NOT /api/graphql.
+	// We can't easily inspect the URL from the githubv4.Client,
+	// so we test the URL construction logic indirectly by checking
+	// the normalized endpoint.
+	apiURL, err := normalizeGHECloudAPIEndpoint("https://company.ghe.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	graphqlURL := strings.TrimRight(apiURL, "/") + "/graphql"
+	expected := "https://api.company.ghe.com/graphql"
+
+	if graphqlURL != expected {
+		t.Errorf("GHE.com GraphQL URL = %q, want %q", graphqlURL, expected)
+	}
+}
+
+func TestCreateAPIClient_GHES_HasAPIV3(t *testing.T) {
+	// GHES clients SHOULD have /api/v3/ — make sure we didn't break that.
+	// Note: WithEnterpriseURLs returns an error for invalid URLs, but for
+	// valid ones it appends /api/v3/.
+	client, err := createAPIClient(context.Background(), http.DefaultClient, "https://github.mycompany.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(client.BaseURL.String(), "/api/v3") {
+		t.Errorf("GHES client BaseURL should contain /api/v3/, got: %s", client.BaseURL.String())
+	}
+}
+
+func TestCreateAPIClient_CloudGitHub(t *testing.T) {
+	// Regular github.com should use the default client (api.github.com).
+	client, err := createAPIClient(context.Background(), http.DefaultClient, cloudV3Endpoint)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if client.BaseURL.String() != "https://api.github.com/" {
+		t.Errorf("expected https://api.github.com/, got: %s", client.BaseURL.String())
 	}
 }
