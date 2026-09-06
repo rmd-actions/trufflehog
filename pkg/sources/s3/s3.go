@@ -1,8 +1,10 @@
 package s3
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -54,6 +56,8 @@ type Source struct {
 	errorCount    *sync.Map
 	jobPool       *errgroup.Group
 	maxObjectSize int64
+	// endpoint is the S3-compatible service to scan, or nil for AWS S3.
+	endpoint *url.URL
 }
 
 // Ensure the Source satisfies the interfaces at compile time
@@ -94,6 +98,12 @@ func (s *Source) Init(
 	}
 	s.conn = &conn
 
+	endpoint, err := normalizeEndpoint(conn.GetEndpoint())
+	if err != nil {
+		return err
+	}
+	s.endpoint = endpoint
+
 	s.metricsCollector = metricsInstance
 
 	s.setMaxObjectSize(conn.GetMaxObjectSize())
@@ -131,6 +141,44 @@ func (s *Source) setMaxObjectSize(maxObjectSize int64) {
 	} else {
 		s.maxObjectSize = maxObjectSize
 	}
+}
+
+// normalizeEndpoint parses the configured endpoint of an S3-compatible
+// service, returning nil for the empty endpoint that means AWS S3. A scheme is
+// assumed when one is missing, because the endpoint is user-entered and the AWS
+// SDK rejects a bare host with an error that does not say so.
+func normalizeEndpoint(endpoint string) (*url.URL, error) {
+	if endpoint == "" {
+		return nil, nil
+	}
+
+	parsed, err := url.Parse(endpoint)
+
+	// Without a scheme, the endpoint either parses as a path with no host or,
+	// when it carries a port, fails to parse at all. Retry those as URLs, but
+	// only when no scheme was given, so that a malformed one is still reported
+	// rather than buried under a second scheme.
+	if !strings.Contains(endpoint, "://") && (err != nil || parsed.Host == "") {
+		parsed, err = url.Parse("https://" + endpoint)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("could not parse endpoint %q: %w", endpoint, err)
+	}
+
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("endpoint %q has no host; expected something like https://s3.internal.example.com", endpoint)
+	}
+
+	return parsed, nil
+}
+
+// defaultRegion returns the region used to sign requests for buckets whose own
+// region has not been discovered.
+func (s *Source) defaultRegion() string {
+	if region := s.conn.GetRegion(); region != "" {
+		return region
+	}
+	return defaultAWSRegion
 }
 
 func (s *Source) newClient(ctx context.Context, region, roleArn string) (*s3.Client, error) {
@@ -182,6 +230,12 @@ func (s *Source) newClient(ctx context.Context, region, roleArn string) (*s3.Cli
 
 	return s3.NewFromConfig(cfg, func(options *s3.Options) {
 		options.DisableLogOutputChecksumValidationSkipped = true
+		if s.endpoint != nil {
+			options.BaseEndpoint = aws.String(s.endpoint.String())
+			// S3-compatible services rarely publish the wildcard DNS that
+			// virtual-hosted addressing needs.
+			options.UsePathStyle = true
+		}
 	}), nil
 }
 
@@ -454,12 +508,18 @@ func (s *Source) getRegionalClientForBucket(
 	role string,
 	bucket string,
 ) (*s3.Client, error) {
+	// GetBucketRegion is an AWS-only API, and a custom endpoint serves every
+	// bucket itself, so there is no per-bucket region to discover.
+	if s.endpoint != nil {
+		return defaultRegionClient, nil
+	}
+
 	region, err := s3manager.GetBucketRegion(ctx, defaultRegionClient, bucket)
 	if err != nil {
 		return nil, fmt.Errorf("could not get s3 region for bucket: %s: %w", bucket, err)
 	}
 
-	if region == defaultAWSRegion {
+	if region == s.defaultRegion() {
 		return defaultRegionClient, nil
 	}
 
@@ -482,59 +542,59 @@ func (s *Source) pageChunker(
 	checkpointer.Reset() // Reset the checkpointer for each PAGE
 	ctx = context.WithValues(ctx, "bucket", metadata.bucket, "page_number", metadata.pageNumber)
 	for objIdx, obj := range metadata.page.Contents {
-		ctx = context.WithValues(ctx, "key", *obj.Key, "size", *obj.Size)
-		if common.IsDone(ctx) {
+		octx := context.WithValues(ctx, "key", *obj.Key, "size", *obj.Size)
+		if common.IsDone(octx) {
 			return
 		}
 
 		// Skip GLACIER and GLACIER_IR objects.
 		if obj.StorageClass == s3types.ObjectStorageClassGlacier || obj.StorageClass == s3types.ObjectStorageClassGlacierIr {
-			ctx.Logger().V(5).Info("Skipping object in storage class", "storage_class", obj.StorageClass)
+			octx.Logger().V(5).Info("Skipping object in storage class", "storage_class", obj.StorageClass)
 			s.metricsCollector.RecordObjectSkipped(metadata.bucket, "storage_class", float64(*obj.Size))
-			if err := checkpointer.UpdateObjectCompletion(ctx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
-				ctx.Logger().Error(err, "could not update progress for glacier object")
+			if err := checkpointer.UpdateObjectCompletion(octx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
+				octx.Logger().Error(err, "could not update progress for glacier object")
 			}
 			continue
 		}
 
 		// Ignore large files.
 		if *obj.Size > s.maxObjectSize {
-			ctx.Logger().V(5).Info("Skipping large file", "max_object_size", s.maxObjectSize)
+			octx.Logger().V(5).Info("Skipping large file", "max_object_size", s.maxObjectSize)
 			s.metricsCollector.RecordObjectSkipped(metadata.bucket, "size_limit", float64(*obj.Size))
-			if err := checkpointer.UpdateObjectCompletion(ctx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
-				ctx.Logger().Error(err, "could not update progress for large file")
+			if err := checkpointer.UpdateObjectCompletion(octx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
+				octx.Logger().Error(err, "could not update progress for large file")
 			}
 			continue
 		}
 
 		// File empty file.
 		if *obj.Size == 0 {
-			ctx.Logger().V(5).Info("Skipping empty file")
+			octx.Logger().V(5).Info("Skipping empty file")
 			s.metricsCollector.RecordObjectSkipped(metadata.bucket, "empty_file", 0)
-			if err := checkpointer.UpdateObjectCompletion(ctx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
-				ctx.Logger().Error(err, "could not update progress for empty file")
+			if err := checkpointer.UpdateObjectCompletion(octx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
+				octx.Logger().Error(err, "could not update progress for empty file")
 			}
 			continue
 		}
 
 		// Skip incompatible extensions.
 		if common.SkipFile(*obj.Key) {
-			ctx.Logger().V(5).Info("Skipping file with incompatible extension")
+			octx.Logger().V(5).Info("Skipping file with incompatible extension")
 			s.metricsCollector.RecordObjectSkipped(metadata.bucket, "incompatible_extension", float64(*obj.Size))
-			if err := checkpointer.UpdateObjectCompletion(ctx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
-				ctx.Logger().Error(err, "could not update progress for incompatible file")
+			if err := checkpointer.UpdateObjectCompletion(octx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
+				octx.Logger().Error(err, "could not update progress for incompatible file")
 			}
 			continue
 		}
 
 		s.jobPool.Go(func() error {
-			defer common.RecoverWithExit(ctx)
-			if common.IsDone(ctx) {
-				return ctx.Err()
+			defer common.RecoverWithExit(octx)
+			if common.IsDone(octx) {
+				return octx.Err()
 			}
 
 			if strings.HasSuffix(*obj.Key, "/") {
-				ctx.Logger().V(5).Info("Skipping directory")
+				octx.Logger().V(5).Info("Skipping directory")
 				s.metricsCollector.RecordObjectSkipped(metadata.bucket, "directory", float64(*obj.Size))
 				return nil
 			}
@@ -547,13 +607,13 @@ func (s *Source) pageChunker(
 				nErr = 0
 			}
 			if nErr.(int) > 3 {
-				ctx.Logger().V(2).Info("Skipped due to excessive errors")
+				octx.Logger().V(2).Info("Skipped due to excessive errors")
 				return nil
 			}
 			// Make sure we use a separate context for the GetObjectWithContext call.
 			// This ensures that the timeout is isolated and does not affect any downstream operations. (e.g. HandleFile)
 			const getObjectTimeout = 30 * time.Second
-			objCtx, cancel := context.WithTimeout(ctx, getObjectTimeout)
+			objCtx, cancel := context.WithTimeout(octx, getObjectTimeout)
 			defer cancel()
 
 			res, err := metadata.client.GetObject(objCtx, &s3.GetObjectInput{
@@ -562,10 +622,10 @@ func (s *Source) pageChunker(
 			})
 			if err != nil {
 				if strings.Contains(err.Error(), "AccessDenied") {
-					ctx.Logger().Error(err, "could not get S3 object; access denied")
+					octx.Logger().Error(err, "could not get S3 object; access denied")
 					s.metricsCollector.RecordObjectSkipped(metadata.bucket, "access_denied", float64(*obj.Size))
 				} else {
-					ctx.Logger().Error(err, "could not get S3 object")
+					octx.Logger().Error(err, "could not get S3 object")
 					s.metricsCollector.RecordObjectError(metadata.bucket)
 				}
 				// According to the documentation for GetObjectWithContext,
@@ -581,14 +641,14 @@ func (s *Source) pageChunker(
 					nErr = 0
 				}
 				if nErr.(int) > 3 {
-					ctx.Logger().V(3).Info("Skipped due to excessive errors")
+					octx.Logger().V(3).Info("Skipped due to excessive errors")
 					return nil
 				}
 				nErr = nErr.(int) + 1
 				state.errorCount.Store(prefix, nErr)
 				// too many consecutive errors on this page
 				if nErr.(int) > 3 {
-					ctx.Logger().V(2).Info("Too many consecutive errors, excluding prefix", "prefix", prefix)
+					octx.Logger().V(2).Info("Too many consecutive errors, excluding prefix", "prefix", prefix)
 				}
 				return nil
 			}
@@ -609,7 +669,7 @@ func (s *Source) pageChunker(
 						S3: &source_metadatapb.S3{
 							Bucket:    metadata.bucket,
 							File:      sanitizer.UTF8(*obj.Key),
-							Link:      sanitizer.UTF8(makeS3Link(metadata.bucket, metadata.client.Options().Region, *obj.Key)),
+							Link:      sanitizer.UTF8(s.objectLink(metadata.bucket, metadata.client.Options().Region, *obj.Key)),
 							Email:     sanitizer.UTF8(email),
 							Timestamp: sanitizer.UTF8(modified),
 						},
@@ -618,13 +678,13 @@ func (s *Source) pageChunker(
 				SourceVerify: s.verify,
 			}
 
-			if err := handlers.HandleFile(ctx, res.Body, chunkSkel, reporter); err != nil {
-				ctx.Logger().Error(err, "error handling file")
+			if err := handlers.HandleFile(octx, res.Body, chunkSkel, reporter); err != nil {
+				octx.Logger().Error(err, "error handling file")
 				s.metricsCollector.RecordObjectError(metadata.bucket)
 				return nil
 			}
 			atomic.AddUint64(state.objectCount, 1)
-			ctx.Logger().V(5).Info("S3 object scanned.", "object_count", state.objectCount)
+			octx.Logger().V(5).Info("S3 object scanned.", "object_count", state.objectCount)
 			nErr, ok = state.errorCount.Load(prefix)
 			if !ok {
 				nErr = 0
@@ -633,8 +693,8 @@ func (s *Source) pageChunker(
 				state.errorCount.Store(prefix, 0)
 			}
 			// Update progress after successful processing.
-			if err := checkpointer.UpdateObjectCompletion(ctx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
-				ctx.Logger().Error(err, "could not update progress for scanned object")
+			if err := checkpointer.UpdateObjectCompletion(octx, objIdx, metadata.bucket, metadata.role, metadata.page.Contents); err != nil {
+				octx.Logger().Error(err, "could not update progress for scanned object")
 			}
 			s.metricsCollector.RecordObjectScanned(metadata.bucket, float64(*obj.Size))
 			return nil
@@ -698,7 +758,7 @@ func (s *Source) visitRoles(
 	for _, role := range roles {
 		s.metricsCollector.RecordRoleScanned(role)
 
-		client, err := s.newClient(ctx, defaultAWSRegion, role)
+		client, err := s.newClient(ctx, s.defaultRegion(), role)
 		if err != nil {
 			return fmt.Errorf("could not create s3 client: %w", err)
 		}
@@ -716,12 +776,22 @@ func (s *Source) visitRoles(
 	return nil
 }
 
-// makeS3Link creates a S3 virtual-hosted–style URIs. They have the format of:
+// objectLink creates a URL for an object. AWS buckets get a
+// virtual-hosted–style URI, which has the format:
 // https://[bucket-name].s3.[region-code].amazonaws.com/[key-name]
 //
 // See https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html#virtual-hosted-style-access
-func makeS3Link(bucket, region, key string) string {
-	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucket, region, key)
+//
+// A custom endpoint gets a path-style link, matching how the client addresses
+// it, so the link resolves the same way the scan did.
+func (s *Source) objectLink(bucket, region, key string) string {
+	if s.endpoint == nil {
+		return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucket, region, key)
+	}
+
+	link := *s.endpoint
+	link.Path = strings.TrimSuffix(link.Path, "/") + "/" + bucket + "/" + key
+	return link.String()
 }
 
 // Enumerate implements SourceUnitEnumerator interface. This implementation visits
@@ -759,7 +829,7 @@ func (s *Source) ChunkUnit(ctx context.Context, unit sources.SourceUnit, reporte
 	}
 	// unitID is a combination of bucket name and role ARN
 	unitID, _ := s3unit.SourceUnitID()
-	defaultClient, err := s.newClient(ctx, defaultAWSRegion, s3unit.Role)
+	defaultClient, err := s.newClient(ctx, s.defaultRegion(), s3unit.Role)
 	if err != nil {
 		return fmt.Errorf("could not create s3 client for bucket %s and role %s: %w", s3unit.Bucket, s3unit.Role, err)
 	}
@@ -781,7 +851,27 @@ func (s *Source) ChunkUnit(ctx context.Context, unit sources.SourceUnit, reporte
 	return nil
 }
 
+// It accepts three shapes: the persisted envelope carrying unit_data
+// (round-trips the unit exactly), the envelope without unit_data (rebuilt from id),
+// and a bare S3SourceUnit.
 func (s *Source) UnmarshalSourceUnit(data []byte) (sources.SourceUnit, error) {
+	var envelope unitEnvelope
+	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Kind == string(SourceUnitKindBucket) {
+		if envelope.UnitData != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(envelope.UnitData); err == nil {
+				var unit S3SourceUnit
+				if json.Unmarshal(decoded, &unit) == nil && unit.Bucket != "" {
+					return unit, nil
+				}
+			}
+		}
+		if envelope.ID != "" {
+			if role, bucket := splitS3SourceUnitID(envelope.ID); bucket != "" {
+				return S3SourceUnit{Bucket: bucket, Role: role}, nil
+			}
+		}
+	}
+
 	var unit S3SourceUnit
 	if err := json.Unmarshal(data, &unit); err != nil {
 		return nil, err

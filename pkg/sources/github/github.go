@@ -1,6 +1,7 @@
 package github
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -81,7 +82,6 @@ type Source struct {
 	commentsTimeframeDays uint32
 
 	sources.Progress
-	sources.CommonSourceUnitUnmarshaller
 
 	useAuthInUrl bool // pass credentials in the repository urls for cloning
 }
@@ -97,6 +97,13 @@ var _ sources.SourceUnit = (*GistUnit)(nil)
 type RepoUnit struct {
 	Name string `json:"name"`
 	URL  string `json:"url"`
+	// InstallationID is the GitHub App installation that owns this repo, set
+	// during scan-all-installations enumeration. Carrying it on the unit lets
+	// ChunkUnit clone with the correct installation token without re-deriving
+	// the mapping, which otherwise re-lists every installation's repos on every
+	// scanned unit (see INT-790). Zero when the source is not an installation
+	// scan or the unit predates this field.
+	InstallationID int64 `json:"installation_id,omitempty"`
 }
 
 func (r RepoUnit) SourceUnitID() (string, sources.SourceUnitKind) { return r.URL, "repo" }
@@ -109,6 +116,66 @@ type GistUnit struct {
 
 func (g GistUnit) SourceUnitID() (string, sources.SourceUnitKind) { return g.URL, "gist" }
 func (g GistUnit) Display() string                                { return g.Name }
+
+// unitEnvelope is just the JSON equivalent of apipb.SourceUnit, so we can
+// unmarshal source unit payloads.
+type unitEnvelope struct {
+	ID       string                 `json:"id"`
+	Kind     sources.SourceUnitKind `json:"kind,omitempty"`
+	Name     string                 `json:"display,omitempty"`
+	UnitData []byte                 `json:"unit_data,omitempty"`
+}
+
+func (u unitEnvelope) SourceUnitID() (string, sources.SourceUnitKind) { return u.ID, u.Kind }
+func (u unitEnvelope) Display() string                                { return u.Name }
+
+func unmarshalSourceUnit[unitType sources.SourceUnit](data []byte) (unitType, error) {
+	u := new(unitType)
+
+	if err := json.Unmarshal(data, u); err != nil {
+		return *new(unitType), err
+	}
+
+	return *u, nil
+}
+
+func (s *Source) UnmarshalSourceUnit(data []byte) (sources.SourceUnit, error) {
+	env, err := unmarshalSourceUnit[unitEnvelope](data)
+	if err != nil {
+		return nil, err
+	}
+
+	switch env.Kind {
+	case "": // data is a raw SourceUnit, no envelope
+		// Look for a raw RepoUnit first
+		ru, err := unmarshalSourceUnit[RepoUnit](data)
+		if err != nil {
+			return nil, err
+		}
+
+		if ru.URL != "" { // This is the test for a valid RepoUnit
+			return ru, nil
+		}
+
+		if env.ID == "" { // This is the test for a valid generic GitHub Source Unit
+			return nil, errors.New("not a github source unit")
+		}
+
+		return env, nil
+	case "repo":
+		if len(env.UnitData) > 0 {
+			return unmarshalSourceUnit[RepoUnit](env.UnitData)
+		}
+		return RepoUnit{Name: env.Name, URL: env.ID}, nil
+	case "gist":
+		if len(env.UnitData) > 0 {
+			return unmarshalSourceUnit[GistUnit](env.UnitData)
+		}
+		return GistUnit{Name: env.Name, URL: env.ID}, nil
+	default:
+		return nil, fmt.Errorf("unrecognized source unit kind %q", env.Kind)
+	}
+}
 
 // --------------------------------------------------------------------------------
 
@@ -433,7 +500,16 @@ func (s *Source) Enumerate(ctx context.Context, reporter sources.UnitReporter) e
 			}
 			continue
 		}
-		if err := dedupeReporter.UnitOk(ctx, RepoUnit{Name: name, URL: url}); err != nil {
+
+		var installationID int64 = 0
+		if ac, ok := s.connector.(*appConnector); ok {
+			ac.ensureRepoInstallation(url, name)
+			installationID, _ = ac.installationIDForRepo(url)
+		}
+
+		ru := RepoUnit{Name: name, URL: url, InstallationID: installationID}
+
+		if err := dedupeReporter.UnitOk(ctx, ru); err != nil {
 			return err
 		}
 	}
@@ -928,6 +1004,18 @@ func (s *Source) mapReposToInstallations(ctx context.Context, connector *appConn
 	}
 
 	if len(wantedRepos) > 0 {
+		errs = errors.Join(errs, s.mapRemainingAccessibleRepos(ctx, connector, wantedRepos))
+		if len(wantedRepos) == 0 {
+			// Every requested repo was mapped, so returning errs would fail
+			// repos that succeeded; log partial enumeration errors instead.
+			if errs != nil {
+				ctx.Logger().Error(errs, "some installations could not be fully enumerated while mapping repos")
+			}
+			return nil
+		}
+	}
+
+	if len(wantedRepos) > 0 {
 		unmatched := make([]string, 0, len(wantedRepos))
 		for _, requested := range wantedRepos {
 			unmatched = append(unmatched, requested.original)
@@ -1026,6 +1114,61 @@ func (s *Source) mapRemainingReposByMetadata(
 				}
 				break
 			}
+		}
+	}
+	return errs
+}
+
+// mapRemainingAccessibleRepos handles repos that no installation owns, such
+// as org members' personal repos enumerated via scan_users. Installations
+// only ever contain repos owned by the installing account, but the default
+// installation token can still read repos that are visible to it (public
+// repos in particular), so a repo that the API confirms accessible is mapped
+// to the default installation instead of failing the scan.
+func (s *Source) mapRemainingAccessibleRepos(
+	ctx context.Context,
+	connector *appConnector,
+	wantedRepos map[string]repoMappingRequest,
+) error {
+	var errs error
+	client := connector.APIClient()
+	for _, requested := range wantedRepos {
+		for i, lookupURL := range requested.lookupURLs {
+			_, parts, err := getRepoURLParts(lookupURL)
+			if err != nil {
+				errs = errors.Join(errs,
+					fmt.Errorf("could not parse configured repo %q: %w", requested.original, err))
+				break
+			}
+
+			var repo *github.Repository
+			for {
+				repo, _, err = client.Repositories.Get(ctx, parts[1], parts[2])
+				if s.handleRateLimit(ctx, err) {
+					continue
+				}
+				break
+			}
+			if err != nil {
+				if isGitHub404Error(err) {
+					continue
+				}
+				errs = errors.Join(errs,
+					fmt.Errorf("could not fetch repo %q with default installation: %w", requested.original, err))
+				break
+			}
+			if !sameRepoHost(requested.normalized, repo.GetCloneURL()) {
+				if i == 0 {
+					break
+				}
+				continue
+			}
+
+			ctx.Logger().Info("repo is not owned by any app installation; scanning with the default installation token",
+				"repo", requested.original)
+			deleteRepoMappingRequest(wantedRepos, requested)
+			s.recordRepoInstallation(connector, connector.installationID, repo, requested)
+			break
 		}
 	}
 	return errs
@@ -2361,8 +2504,14 @@ func (s *Source) ChunkUnit(ctx context.Context, unit sources.SourceUnit, reporte
 	repoURL, kind := unit.SourceUnitID()
 	ctx = context.WithValue(ctx, "repo", repoURL)
 
-	if connector, ok := s.connector.(*appConnector); ok && s.conn.ScanAllInstallations && kind == "repo" {
-		if err := s.mapReposToInstallations(ctx, connector, []string{repoURL}); err != nil {
+	// If the unit has an installation ID, use it. Fetching it is slow,
+	// specifically it stalls large multi-org scans on rate limits (INT-790).
+
+	// [CG] This is pretty ugly; if you can clean it up please do (I failed).
+	if ac, ok := s.connector.(*appConnector); ok && s.conn.ScanAllInstallations && kind == "repo" {
+		if ru, ok := unit.(RepoUnit); ok && ru.InstallationID > 0 {
+			ac.setRepoInstallationForRepoName(repoURL, ru.Name, ru.InstallationID)
+		} else if err := s.mapReposToInstallations(ctx, ac, []string{repoURL}); err != nil {
 			return err
 		}
 	}
