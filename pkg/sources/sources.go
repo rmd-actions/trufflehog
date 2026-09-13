@@ -417,6 +417,18 @@ type S3Config struct {
 	Roles []string
 	// MaxObjectSize is the maximum object size to scan.
 	MaxObjectSize int64
+	// Endpoint targets an S3-compatible service other than AWS S3.
+	Endpoint string
+	// Region is the region used to sign requests.
+	Region string
+	// IncludePrefixes limits the scan to objects under these key prefixes.
+	IncludePrefixes []string
+	// ExcludePrefixes skips objects under these key prefixes.
+	ExcludePrefixes []string
+	// IncludeExtensions limits the scan to objects with these file extensions.
+	IncludeExtensions []string
+	// ExcludeExtensions skips objects with these file extensions.
+	ExcludeExtensions []string
 }
 
 // SyslogConfig defines the optional configuration for a syslog source.

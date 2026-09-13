@@ -13,6 +13,7 @@ var (
 	UserAgentSuffix                          AtomicString
 	UseSimplifiedGitlabEnumeration           atomic.Bool
 	UseGitMirror                             atomic.Bool
+	UseGitLowMemoryScan                      atomic.Bool
 	GitlabProjectsPerPage                    atomic.Int64
 	UseGithubGraphQLAPI                      atomic.Bool // use github graphql api to fetch issues, pr's and comments
 	HTMLDecoderEnabled                       atomic.Bool
@@ -42,11 +43,17 @@ var (
 	CloudflareApiTokenV2DetectorEnabled      atomic.Bool
 	CloudflareGlobalApiKeyV2DetectorEnabled  atomic.Bool
 	DuoDetectorEnabled                       atomic.Bool
+	FigmaV3DetectorEnabled                   atomic.Bool
 	NewRelicLicenseKeyDetectorEnabled        atomic.Bool
 	NewRelicBrowserKeyDetectorEnabled        atomic.Bool
 	NewRelicUserKeyDetectorEnabled           atomic.Bool
 	NewRelicInsightsQueryKeyDetectorEnabled  atomic.Bool
 	NewRelicMobileAppTokenDetectorEnabled    atomic.Bool
+	MSTeamsWebhookV2DetectorEnabled          atomic.Bool
+	SolarwindsDetectorEnabled                atomic.Bool
+	ResendDetectorEnabled                    atomic.Bool
+	WeightsAndBiasesV2DetectorEnabled        atomic.Bool
+	HumioAPITokenDetectorEnabled             atomic.Bool
 )
 
 type AtomicString struct {

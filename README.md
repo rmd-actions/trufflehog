@@ -233,6 +233,8 @@ Expected output:
 ...
 ```
 
+TruffleHog can also output [SARIF](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) with `--sarif` instead of `--json`. GitHub code scanning understands SARIF natively, so uploading it surfaces findings inline on pull request diffs and in the repository's Security tab, and tracks findings as new/fixed across scans instead of reporting the same one every run — see the [TruffleHog Github Action](#octocat-trufflehog-github-action) section below for how to upload it. Note that, unlike the other output formats, SARIF results are buffered in memory for the full scan and written out at the end, since SARIF requires a single JSON document rather than a stream — fine for typical scans, but scans producing a very large number of results will use proportionally more memory.
+
 ## 5: Scan a GitHub Repo + its Issues and Pull Requests
 
 ```bash
@@ -464,6 +466,8 @@ Flags:
       --[no-]json-legacy         Use the pre-v3.0 JSON format. Only works with git, gitlab,
                                  and github sources.
       --[no-]github-actions      Output in GitHub Actions format.
+      --[no-]sarif               Output in SARIF format for upload to GitHub code scanning (e.g.
+                                 via github/codeql-action/upload-sarif).
       --concurrency=12           Number of concurrent workers.
       --[no-]no-verification     Don't verify the results.
       --results=RESULTS          Specifies which type(s) of results to output: verified (confirmed
@@ -593,7 +597,7 @@ The regex detectors can be used with any subcommand, while the sources defined
 in configuration are only for the `multi-scan` subcommand.
 
 The configuration format for sources can be found on Truffle Security's
-[source configuration documentation page](https://docs.trufflesecurity.com/scan-data-for-secrets).
+[source configuration documentation page](https://trufflesecurity.com/docs/connect-sources).
 
 Example GitHub source configuration and [options reference](https://docs.trufflesecurity.com/github#Fvm1I):
 
@@ -635,6 +639,58 @@ Multiple roles can be passed as separate arguments. The following command will a
 ```bash
 trufflehog s3 --role-arn=<iam-role-arn-1> --role-arn=<iam-role-arn-2>
 ```
+
+### Narrowing a scan to specific objects
+
+Large buckets often hold data that is never worth scanning, such as archives, media, and build artifacts. Two sets of flags keep those objects out of a scan. Both are matched against the object key before the object is downloaded, so a skipped object costs no GET request.
+
+Scan only the objects under one or more key prefixes:
+
+```bash
+trufflehog s3 --bucket=<bucket-name> --include-prefix=infra/ --include-prefix=services/
+```
+
+Skip the objects under a key prefix:
+
+```bash
+trufflehog s3 --bucket=<bucket-name> --exclude-prefix=projects/archived/
+```
+
+Both prefix flags can be used together to scan a subtree while leaving one part of it out. An object that matches an exclude prefix is always skipped, even if it also matches an include prefix:
+
+```bash
+trufflehog s3 --bucket=<bucket-name> --include-prefix=src/ --exclude-prefix=src/vendor/
+```
+
+Prefixes are matched literally, not as globs, and they are not confined to a path boundary. `--include-prefix=log` matches both `logs/app.txt` and `logs-archive/app.txt`.
+
+File extensions are filtered separately. Write them without a leading dot:
+
+```bash
+trufflehog s3 --bucket=<bucket-name> --exclude-extension=zip --exclude-extension=mp4
+```
+
+```bash
+trufflehog s3 --bucket=<bucket-name> --include-extension=tf --include-extension=yaml
+```
+
+Unlike the prefix flags, `--include-extension` and `--exclude-extension` cannot be combined, because naming the extensions to scan already excludes every other one. Using both fails at startup.
+
+Extension matching is case insensitive, so `--exclude-extension=zip` also skips `BACKUP.ZIP`. An object whose key has no extension at all, such as `Makefile`, matches no entry: it is skipped when `--include-extension` is set, and kept when only `--exclude-extension` is set.
+
+Two things to watch when using `--include-extension`. A dotfile counts as all extension, so `.env` has the extension `env` and any include list that leaves out `env` will skip every `.env` file in the bucket. Since `.env` files are a common place for secrets to sit, add `--include-extension=env` unless you mean to skip them. And only the last extension counts, so `backup.tar.gz` has the extension `gz`: `--exclude-extension=tar.gz` matches nothing, while `--exclude-extension=gz` works.
+
+These flags also apply to object keys only, not to files inside an archive. `--exclude-extension=mp4` skips `clip.mp4` sitting in the bucket, but not a `clip.mp4` packed inside `media.zip`. Excluding `zip` skips the archive entirely.
+
+Filtering happens after TruffleHog lists a bucket, so it cuts the cost of downloading objects but not the cost of listing them. A bucket is still paginated in full even when a prefix covers a small part of it.
+
+Prefixes and extensions are applied together. An object has to pass both to be scanned, so the command below scans `src/main.tf` but skips both `src/bundle.zip` and `docs/guide.tf`:
+
+```bash
+trufflehog s3 --bucket=<bucket-name> --include-prefix=src/ --exclude-extension=zip
+```
+
+These flags narrow the objects within a bucket. To narrow which buckets are scanned, use `--bucket` or `--ignore-bucket`, which unlike the prefix flags cannot be used together.
 
 Exit Codes:
 
@@ -725,6 +781,17 @@ TruffleHog statically detects [https://canarytokens.org/](https://canarytokens.o
 
 If you'd like to specify specific `base` and `head` refs, you can use the `base` argument (`--since-commit` flag in TruffleHog CLI) and the `head` argument (`--branch` flag in the TruffleHog CLI). We only recommend using these arguments for very specific use cases, where the default behavior does not work.
 
+To upload results to GitHub code scanning instead, run TruffleHog directly with `--sarif` and pass the output to `github/codeql-action/upload-sarif`:
+
+```yaml
+- name: TruffleHog
+  run: trufflehog filesystem . --sarif --no-verification > results.sarif
+- name: Upload SARIF results
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: results.sarif
+```
+
 #### Advanced Usage: Scan entire branch
 
 ```
@@ -782,6 +849,8 @@ status code, the secret is considered verified. If verification fails due to net
 Custom Detectors support a few different filtering mechanisms: entropy, regex targeting the entire match, regex targeting the captured secret,
 and excluded word lists checked against the secret (captured group if present, entire match if capture group is not present). Note that if
 your custom detector has multiple `regex` set (in this example `hogID`, and `hogToken`), then the filters get applied to each regex. [Here](examples/generic_with_filters.yml) is an example of a custom detector using these filters.
+
+The `verify` section is optional — if you omit it, matches are still reported as unverified, no webhook required. This makes Custom Detectors useful for flagging generic hardcoded secrets (e.g. `*.password=`, `*.secret=`) in config files like `.properties`, `.env`, or `.yaml` that TruffleHog's built-in, verified detectors won't otherwise catch. [Here](examples/generic_config_secrets.yml) is an example tuned for that use case.
 
 **NB:** This feature is alpha and subject to change.
 
