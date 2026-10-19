@@ -76,14 +76,36 @@ error: 7457 bytes of body are still expected
 fetch-pack: unexpected disconnect while reading sideband packet
 fatal: early EOF
 fatal: fetch-pack: invalid index-pack output`,
+		// Bare 403/429 during clone matches GitHub/GitLab secondary rate
+		// limiting (no accompanying auth/permission message).
+		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, fatal: unable to access 'https://github.com/org/repo.git/': The requested URL returned error: 403",
+		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, The requested URL returned error: 429",
+		// Normal clone progress ("remote: Counting objects...") must not be
+		// mistaken for a denial explanation when a later 403 is just throttling.
+		`could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, remote: Enumerating objects: 100, done.
+remote: Counting objects: 100% (100/100), done.
+fatal: unable to access 'https://github.com/org/repo.git/': The requested URL returned error: 403`,
 	}
 	for _, msg := range retryable {
 		assert.True(t, isRetryableCloneError(errors.New(msg)), "expected retryable: %q", msg)
 	}
 
 	notRetryable := []string{
-		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, remote: The requested URL returned error: 403",
-		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, The requested URL returned error: 429",
+		// An explicit permission-denial message, as opposed to a bare 403.
+		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, remote: You are not allowed to download code from this project.",
+		// The explicit denial message must win even when the combined clone
+		// output also contains a literal "403" elsewhere.
+		"could not clone repo: https://gitlab.com/org/repo.git, error executing git clone: exit status 128, fatal: unable to access 'https://gitlab.com/org/repo.git/': The requested URL returned error: 403\nremote: You are not allowed to download code from this project.",
+		// GitHub's explicit permission-denial message, which also co-occurs
+		// with a literal "403" in the combined clone output.
+		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, remote: Permission to org/repo.git denied to user.\nfatal: unable to access 'https://github.com/org/repo.git/': The requested URL returned error: 403",
+		// GitHub Apps/fine-grained-token variant: "Write access ... not
+		// granted", also co-occurring with a literal 403.
+		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, remote: Write access to repository not granted.\nfatal: unable to access 'https://github.com/org/repo.git/': The requested URL returned error: 403",
+		// SAML SSO enforcement: an unrecognized "remote:" explanation
+		// co-occurring with a 403, which the classifier must treat as a
+		// permanent failure without needing this exact wording enumerated.
+		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, remote: The organization has enabled or enforced SAML SSO.\nfatal: unable to access 'https://github.com/org/repo.git/': The requested URL returned error: 403",
 		"git clone timed out (after 1h0m0s)",
 		"could not clone repo: https://github.com/org/repo.git, error executing git clone: exit status 128, fatal: repository 'https://github.com/org/repo.git/' not found",
 	}
@@ -1522,4 +1544,50 @@ func TestGitChunk_LongLine(t *testing.T) {
 	// ensure the goroutine has finished writing to count before we read it
 	// one chunk for the commit/file metadata, and at least one chunk for the file content
 	assert.Equal(t, 2, count, "expected two chunks from a file with a 100 KB line")
+}
+
+func TestGitLowMemoryScan(t *testing.T) {
+	feature.UseGitLowMemoryScan.Store(true)
+	t.Cleanup(func() { feature.UseGitLowMemoryScan.Store(false) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	thisrepo := &sourcespb.Git{
+		Directories: []string{"../../../"},
+		Credential: &sourcespb.Git_Unauthenticated{
+			Unauthenticated: &credentialspb.Unauthenticated{},
+		},
+	}
+	wantChunk := &sources.Chunk{
+		SourceType:   sourcespb.SourceType_SOURCE_TYPE_GIT,
+		SourceName:   "this repo, low memory",
+		SourceVerify: false,
+	}
+
+	s := Source{}
+	conn, err := anypb.New(thisrepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.Init(ctx, "this repo, low memory", 0, 0, false, conn, 1)
+	if err != nil {
+		t.Errorf("Source.Init() error = %v", err)
+		return
+	}
+
+	chunksCh := make(chan *sources.Chunk, 1)
+	go func() {
+		assert.NoError(t, s.Chunks(ctx, chunksCh))
+	}()
+
+	gotChunk := <-chunksCh
+	gotChunk.Data = nil
+	// Commits don't come in a deterministic order, so remove metadata comparison
+	gotChunk.SourceMetadata = nil
+	if diff := pretty.Compare(gotChunk, wantChunk); diff != "" {
+		t.Errorf("Source.Chunks() UseGitLowMemoryScan diff: (-got +want)\n%s", diff)
+		t.Errorf("Data: %s", string(gotChunk.Data))
+	}
 }
