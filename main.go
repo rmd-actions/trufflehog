@@ -60,12 +60,18 @@ var (
 	noVerification      = cli.Flag("no-verification", "Don't verify the results.").Bool()
 	onlyVerified        = cli.Flag("only-verified", "Only output verified results.").Hidden().Bool()
 	results             = cli.Flag("results", "Specifies which type(s) of results to output: verified (confirmed valid by API), unknown (verification failed due to error), unverified (detected but not verified), filtered_unverified (unverified but would have been filtered out). Defaults to verified,unverified,unknown.").String()
-	noColor             = cli.Flag("no-color", "Disable colorized output").Bool()
-	noColour            = cli.Flag("no-colour", "Alias for --no-color").Hidden().Bool()
+
+	// The default cache size is 5000 entries, which is a balance between memory usage and the need for effective deduplication.
+	// Since the cache entries are md5 hashes so each entry would be 16 bytes, so in total this would be aorund 80KB of memory usage.
+	dedupeCacheSize = cli.Flag("deduplication-cache-size", "Max size of the results deduplication cache, setting to 0 disables").Default("5000").Int()
+
+	noColor  = cli.Flag("no-color", "Disable colorized output").Bool()
+	noColour = cli.Flag("no-colour", "Alias for --no-color").Hidden().Bool()
 
 	allowVerificationOverlap   = cli.Flag("allow-verification-overlap", "Allow verification of similar credentials across detectors").Bool()
 	filterUnverified           = cli.Flag("filter-unverified", "Only output first unverified result per chunk per detector if there are more than one results.").Bool()
 	filterEntropy              = cli.Flag("filter-entropy", "Filter unverified results with Shannon entropy. Start with 3.0.").Float64()
+	noIgnoreTag                = cli.Flag("no-ignore-tag", "Report results even if the line has a 'trufflehog:ignore' comment.").Bool()
 	scanEntireChunk            = cli.Flag("scan-entire-chunk", "Scan the entire chunk for secrets.").Hidden().Default("false").Bool()
 	maxDecodeDepth             = cli.Flag("max-decode-depth", "Maximum depth of iterative decoding. Each decoder's output is fed back through all decoders, up to this limit. 1 = single pass, 2+ = chained decoding (e.g., base64 inside utf16).").Default("5").Int()
 	compareDetectionStrategies = cli.Flag("compare-detection-strategies", "Compare different detection strategies for matching spans").Hidden().Default("false").Bool()
@@ -588,6 +594,8 @@ func run(state overseer.State, logSync func() error) {
 	feature.ResendDetectorEnabled.Store(true)
 	feature.WeightsAndBiasesV2DetectorEnabled.Store(true)
 	feature.HumioAPITokenDetectorEnabled.Store(true)
+	feature.KongKonnectDetectorEnabled.Store(true)
+	feature.SonarQubeDetectorEnabled.Store(true)
 
 	conf := &config.Config{}
 	if *configFilename != "" {
@@ -660,12 +668,14 @@ func run(state overseer.State, logSync func() error) {
 		Dispatcher:               engine.NewPrinterDispatcher(printer),
 		FilterUnverified:         *filterUnverified,
 		FilterEntropy:            *filterEntropy,
+		NoIgnoreTag:              *noIgnoreTag,
 		VerificationOverlap:      *allowVerificationOverlap,
 		Results:                  parsedResults,
 		PrintAvgDetectorTime:     *printAvgDetectorTime,
 		ShouldScanEntireChunk:    *scanEntireChunk,
 		MaxDecodeDepth:           *maxDecodeDepth,
 		VerificationCacheMetrics: &verificationCacheMetrics,
+		DedupeCacheSize:          *dedupeCacheSize,
 	}
 
 	if !*noVerificationCache {
@@ -897,7 +907,11 @@ func runSingleScan(ctx context.Context, cmd string, cfg engine.Config) (metrics,
 
 			// Override git configuration for pre-commit hook context
 			gitCfg.TrustLocalGitConfig = true
-			gitCfg.BaseRef = "HEAD" // Only scan staged changes
+			// Only scan staged changes. Both ends are HEAD so the commit range is
+			// HEAD..HEAD, which is empty; a base with no head would instead walk
+			// every ref not reachable from HEAD (see gitparse.Parser.RepoPath).
+			gitCfg.BaseRef = "HEAD"
+			gitCfg.HeadRef = "HEAD"
 
 			// Override result filters for pre-commit hook context
 			// In hook mode, we only want to show verified secrets and unknown findings
