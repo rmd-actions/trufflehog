@@ -406,6 +406,8 @@ aws s3 cp s3://example/gzipped/data.gz - | gunzip -c | trufflehog stdin
   - A verified result means TruffleHog confirmed the credential is valid by testing it against the service's API. For private keys, we've confirmed the key can be used live for SSH or SSL authentication. Check out our Driftwood blog post to learn more [Blog post](https://trufflesecurity.com/blog/driftwood-know-if-private-keys-are-sensitive/)
 - Is there an easy way to ignore specific secrets?
   - If the scanned source [supports line numbers](https://github.com/trufflesecurity/trufflehog/blob/d6375ba92172fd830abb4247cca15e3176448c5d/pkg/engine/engine.go#L358-L365), then you can add a `trufflehog:ignore` comment on the line containing the secret to ignore that secrets.
+- Can I find secrets with `trufflehog:ignore` included?
+  - Pass `--no-ignore-tag` to report results even when their line carries a `trufflehog:ignore` comment. This is useful for reviewing previously accepted findings.
 
 # :newspaper: What's new in v3?
 
@@ -682,7 +684,7 @@ Two things to watch when using `--include-extension`. A dotfile counts as all ex
 
 These flags also apply to object keys only, not to files inside an archive. `--exclude-extension=mp4` skips `clip.mp4` sitting in the bucket, but not a `clip.mp4` packed inside `media.zip`. Excluding `zip` skips the archive entirely.
 
-Filtering happens after TruffleHog lists a bucket, so it cuts the cost of downloading objects but not the cost of listing them. A bucket is still paginated in full even when a prefix covers a small part of it.
+TruffleHog asks S3 to list only the keys under the include prefixes, so a prefix that covers a small part of a large bucket is listed quickly. Exclude prefixes and extensions are applied after listing, so they cut the cost of downloading objects but not the cost of listing them.
 
 Prefixes and extensions are applied together. An object has to pass both to be scanned, so the command below scans `src/main.tf` but skips both `src/bundle.zip` and `docs/guide.tf`:
 
