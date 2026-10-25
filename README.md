@@ -406,6 +406,8 @@ aws s3 cp s3://example/gzipped/data.gz - | gunzip -c | trufflehog stdin
   - A verified result means TruffleHog confirmed the credential is valid by testing it against the service's API. For private keys, we've confirmed the key can be used live for SSH or SSL authentication. Check out our Driftwood blog post to learn more [Blog post](https://trufflesecurity.com/blog/driftwood-know-if-private-keys-are-sensitive/)
 - Is there an easy way to ignore specific secrets?
   - If the scanned source [supports line numbers](https://github.com/trufflesecurity/trufflehog/blob/d6375ba92172fd830abb4247cca15e3176448c5d/pkg/engine/engine.go#L358-L365), then you can add a `trufflehog:ignore` comment on the line containing the secret to ignore that secrets.
+- Can I find secrets with `trufflehog:ignore` included?
+  - Pass `--no-ignore-tag` to report results even when their line carries a `trufflehog:ignore` comment. This is useful for reviewing previously accepted findings.
 
 # :newspaper: What's new in v3?
 
@@ -425,7 +427,7 @@ For every potential credential that is detected, we've painstakingly implemented
 - **unverified**: Credential detected but not confirmed valid (may be invalid, expired, or verification disabled)  
 - **unknown**: Verification attempted but failed due to errors, such as a network or API failure
 
-For example, the [AWS credential detector](pkg/detectors/aws/aws.go) performs a `GetCallerIdentity` API call against the AWS API to verify if an AWS credential is active.
+For example, the [AWS credential detector](pkg/detectors/aws/access_keys/accesskey.go) performs a `GetCallerIdentity` API call against the AWS API to verify if an AWS credential is active.
 
 # :memo: Usage
 
@@ -568,7 +570,7 @@ jenkins --url=URL [<flags>]
     Scan Jenkins
 
 huggingface [<flags>]
-    Find credentials in HuggingFace datasets, models and spaces.
+    Find credentials in HuggingFace datasets, models, spaces and buckets.
 
 stdin
     Find credentials from stdin.
@@ -615,6 +617,24 @@ sources:
 
 You may define multiple connections under the `sources` key (see above), and
 TruffleHog will scan all of the sources concurrently.
+
+To see debug logs for just one source, add `debug: true` to it. That source
+writes all of its debug logs, and every other source keeps the normal log level.
+This is useful when one source out of many is misbehaving:
+
+```yaml
+sources:
+- connection:
+    '@type': type.googleapis.com/sources.GitHub
+    repositories:
+    - https://github.com/trufflesecurity/test_keys.git
+    unauthenticated: {}
+  name: example config scan
+  type: SOURCE_TYPE_GITHUB
+  debug: true
+```
+
+To turn on debug logs for every source, use `--log-level=5` instead.
 
 ## S3
 
@@ -682,7 +702,7 @@ Two things to watch when using `--include-extension`. A dotfile counts as all ex
 
 These flags also apply to object keys only, not to files inside an archive. `--exclude-extension=mp4` skips `clip.mp4` sitting in the bucket, but not a `clip.mp4` packed inside `media.zip`. Excluding `zip` skips the archive entirely.
 
-Filtering happens after TruffleHog lists a bucket, so it cuts the cost of downloading objects but not the cost of listing them. A bucket is still paginated in full even when a prefix covers a small part of it.
+TruffleHog asks S3 to list only the keys under the include prefixes, so a prefix that covers a small part of a large bucket is listed quickly. Exclude prefixes and extensions are applied after listing, so they cut the cost of downloading objects but not the cost of listing them.
 
 Prefixes and extensions are applied together. An object has to pass both to be scanned, so the command below scans `src/main.tf` but skips both `src/bundle.zip` and `docs/guide.tf`:
 
