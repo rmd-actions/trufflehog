@@ -15,19 +15,25 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-logr/zapr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-github/v67/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/anypb"
 	"gopkg.in/h2non/gock.v1"
 
 	"github.com/trufflesecurity/trufflehog/v3/pkg/cache/simple"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/context"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/log/logtest"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/credentialspb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/source_metadatapb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/sourcespb"
@@ -327,7 +333,8 @@ func TestAddMembersByApp(t *testing.T) {
 				InstallationId: "1337",
 				AppId:          "4141",
 			},
-		}})
+		},
+	})
 	err := s.addMembersByApp(context.Background(), s.connector.(*appConnector), noopReporter())
 	assert.Nil(t, err)
 	assert.Equal(t, 3, len(s.memberCache))
@@ -375,15 +382,11 @@ func TestAppConnector_EnterpriseBaseURL(t *testing.T) {
 	privateKey := createPrivateKey()
 	enterpriseEndpoint := "https://api.example.ghe.com"
 
-	connector, err := NewAppConnector(
-		context.Background(),
-		enterpriseEndpoint,
-		&credentialspb.GitHubApp{
-			PrivateKey:     privateKey,
-			InstallationId: "1337",
-			AppId:          "4141",
-		},
-		false)
+	connector, err := NewAppConnector(context.Background(), enterpriseEndpoint, &credentialspb.GitHubApp{
+		PrivateKey:     privateKey,
+		InstallationId: "1337",
+		AppId:          "4141",
+	}, false)
 	require.NoError(t, err)
 
 	appConn, ok := connector.(*appConnector)
@@ -438,7 +441,8 @@ func TestValidate_ScanAllInstallationsWithoutDefaultInstallation(t *testing.T) {
 				PrivateKey: createPrivateKey(),
 				AppId:      "4141",
 			},
-		}})
+		},
+	})
 
 	errs := s.Validate(context.Background())
 	assert.Empty(t, errs)
@@ -1071,6 +1075,61 @@ func TestEnumerateWithAppScanAllInstallationsIncludesConfiguredInstallation(t *t
 	assert.Equal(t, int64(2448), connector.repoInstallationMap["https://github.com/other-org/repo.git"])
 	assert.True(t, s.filteredRepoCache.Exists("default-org/repo"))
 	assert.True(t, s.filteredRepoCache.Exists("other-org/repo"))
+}
+
+func TestEnumerateWithAppScanUsersListsMemberReposButNotGists(t *testing.T) {
+	privateKey := createPrivateKey()
+
+	var (
+		mu    sync.Mutex
+		paths []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			_, _ = w.Write([]byte(`{"token":"token","expires_at":"2099-01-01T00:00:00Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/installation/repositories"):
+			_, _ = w.Write([]byte(`{"total_count":0,"repositories":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/app/installations"):
+			_, _ = w.Write([]byte(`[{"id":1337,"account":{"login":"default-org","type":"Organization"}}]`))
+		case strings.HasSuffix(r.URL.Path, "/orgs/default-org/members"):
+			_, _ = w.Write([]byte(`[{"login":"alice"}]`))
+		case strings.HasSuffix(r.URL.Path, "/users/alice/repos"):
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	s, conn := createTestSource(&sourcespb.GitHub{
+		Endpoint:  server.URL,
+		ScanUsers: true,
+		Credential: &sourcespb.GitHub_GithubApp{
+			GithubApp: &credentialspb.GitHubApp{
+				PrivateKey:     privateKey,
+				InstallationId: "1337",
+				AppId:          "4141",
+			},
+		},
+	})
+	require.NoError(t, s.Init(context.Background(), "test - github", 0, 1337, false, conn, 1))
+	require.False(t, s.ignoreGists)
+
+	err := s.enumerateWithApp(context.Background(), s.connector.(*appConnector), noopReporter())
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Contains(t, paths, "/api/v3/users/alice/repos")
+	for _, path := range paths {
+		assert.NotContains(t, path, "gists")
+	}
 }
 
 func TestEnumerateWithAppScanAllInstallationsMapsExplicitReposBeforeMetadataFetch(t *testing.T) {
@@ -2334,11 +2393,8 @@ func Test_ScanMultipleTargets_MultipleErrors(t *testing.T) {
 
 func TestScanAllInstallationsTargetMappingErrorIsTargetedScanError(t *testing.T) {
 	s := &Source{
-		conn: &sourcespb.GitHub{ScanAllInstallations: true},
-		connector: &appConnector{
-			clientsByInstallationID: make(map[int64]*appInstallationClients),
-			repoInstallationMap:     make(map[string]int64),
-		},
+		conn:      &sourcespb.GitHub{ScanAllInstallations: true},
+		connector: &appConnector{},
 	}
 	ctx := context.Background()
 	chunksChan := make(chan *sources.Chunk)
@@ -2995,4 +3051,193 @@ func TestCreateAPIClient_CloudGitHub(t *testing.T) {
 	if client.BaseURL.String() != "https://api.github.com/" {
 		t.Errorf("expected https://api.github.com/, got: %s", client.BaseURL.String())
 	}
+}
+
+func TestEnumerateWithToken_DebugLogging(t *testing.T) {
+	const testToken = "ghp_TESTTOKENdonotlog1234567890abcdef"
+
+	// mock one page of repos: one to scan, plus one of each kind we skip
+	mockAPI := func() {
+		gock.New("https://api.github.com").
+			Get("/user").
+			Reply(200).
+			JSON(map[string]string{"login": "test-user"})
+
+		gock.New("https://api.github.com").
+			Get("/user/repos").
+			Reply(200).
+			JSON([]map[string]any{
+				{"full_name": "test-user/kept-repo", "clone_url": "https://github.com/test-user/kept-repo.git"},
+				{"full_name": "test-user/forked-repo", "clone_url": "https://github.com/test-user/forked-repo.git", "fork": true},
+				{"full_name": "test-user/archived-repo", "clone_url": "https://github.com/test-user/archived-repo.git", "archived": true},
+				{"full_name": "test-user/ignored-repo", "clone_url": "https://github.com/test-user/ignored-repo.git"},
+			})
+
+		gock.New("https://api.github.com").
+			Get("/user/orgs").
+			Reply(200).
+			JSON(`[]`)
+
+		gock.New("https://api.github.com").
+			Get("/users/test-user/gists").
+			Reply(200).
+			JSON(`[]`)
+	}
+
+	// init the source with the given context and list the repos
+	runEnumerate := func(t *testing.T, ctx context.Context) *Source {
+		s, conn := createTestSource(&sourcespb.GitHub{
+			Endpoint:        "https://api.github.com",
+			Credential:      &sourcespb.GitHub_Token{Token: testToken},
+			ExcludeArchived: true,
+			IgnoreRepos:     []string{"test-user/ignored-repo"},
+		})
+		assert.NoError(t, s.Init(ctx, "test - github", 1, 1337, false, conn, 1))
+		gock.InterceptClient(s.connector.APIClient().Client())
+
+		assert.NoError(t, s.enumerateWithToken(ctx, false, noopReporter()))
+		assert.True(t, gock.IsDone())
+		return s
+	}
+
+	t.Run("debug on", func(t *testing.T) {
+		defer gock.Off()
+		mockAPI()
+
+		ctx, logs := logtest.DebugContext()
+		ctx = context.WithValues(ctx, "source_name", "test - github", "job_id", 1)
+		s := runEnumerate(t, ctx)
+		assert.True(t, s.filteredRepoCache.Exists("test-user/kept-repo"))
+
+		// the config line from Init shows the auth type and filters, not the token
+		initLines := logs.FilterMessage("github source initialized").All()
+		if assert.Len(t, initLines, 1) {
+			fields := initLines[0].ContextMap()
+			assert.Equal(t, "*sourcespb.GitHub_Token", fields["auth_type"])
+			assert.Equal(t, int64(1), fields["ignore_repo_count"])
+			assert.Equal(t, true, fields["exclude_archived"])
+		}
+
+		// the page line and one skip line for each skipped repo, with the reason
+		assert.Equal(t, 1, logs.FilterMessage("Listed repos").Len())
+		reasons := map[string]string{}
+		for _, entry := range logs.FilterMessage("skipping repository").All() {
+			fields := entry.ContextMap()
+			reasons[fields["repo"].(string)] = fields["reason"].(string)
+		}
+		assert.Equal(t, map[string]string{
+			"test-user/forked-repo":   "forks are not included",
+			"test-user/archived-repo": "archived repos are excluded",
+			"test-user/ignored-repo":  "excluded by include or ignore filter",
+		}, reasons)
+
+		// every line came from the context logger, so it has the source fields,
+		// and no line contains the token
+		for _, entry := range logs.All() {
+			fields := entry.ContextMap()
+			assert.Contains(t, fields, "source_name", "line %q", entry.Message)
+			assert.Contains(t, fields, "job_id", "line %q", entry.Message)
+			assert.NotContains(t, entry.Message, testToken)
+			assert.NotContains(t, fmt.Sprint(fields), testToken)
+		}
+	})
+
+	t.Run("debug off", func(t *testing.T) {
+		defer gock.Off()
+		mockAPI()
+
+		core, logs := observer.New(zapcore.InfoLevel)
+		ctx := context.WithLogger(context.Background(), zapr.NewLogger(zap.New(core)))
+		runEnumerate(t, ctx)
+
+		assert.Zero(t, logs.FilterMessage("Listed repos").Len())
+		assert.Zero(t, logs.FilterMessage("skipping repository").Len())
+	})
+}
+
+func TestScan_LogsResumeAndCancelSkips(t *testing.T) {
+	const testToken = "ghp_TESTTOKENinrepourl1234567890"
+
+	s := initTestSource(&sourcespb.GitHub{
+		Endpoint:   "https://api.github.com",
+		Credential: &sourcespb.GitHub_Token{Token: "token"},
+	})
+	s.repos = []string{
+		"https://github.com/org/a.git",
+		"https://github.com/org/b.git",
+		// a repo from the config with a token in it, which must never be logged
+		"https://user:" + testToken + "@github.com/org/c.git",
+	}
+	// pretend an earlier run stopped while scanning b, so a is already done
+	s.SetProgressComplete(0, 3, "", sources.EncodeResumeInfo([]string{"https://github.com/org/b.git"}))
+
+	// cancel before the scan starts, so no repo is cloned and each one is
+	// skipped with a log line instead
+	debugCtx, logs := logtest.DebugContext()
+	ctx, cancel := context.WithCancel(debugCtx)
+	cancel()
+
+	assert.NoError(t, s.scan(ctx, &collectingReporter{}))
+
+	resumeLines := logs.FilterMessage("resuming scan; skipping repos already scanned").All()
+	if assert.Len(t, resumeLines, 1) {
+		assert.Equal(t, int64(1), resumeLines[0].ContextMap()["skipped"])
+		assert.Equal(t, int64(2), resumeLines[0].ContextMap()["remaining"])
+	}
+
+	var cancelled []string
+	for _, entry := range logs.FilterMessage("skipping repo").All() {
+		assert.Equal(t, "scan cancelled", entry.ContextMap()["reason"])
+		cancelled = append(cancelled, entry.ContextMap()["repo"].(string))
+	}
+	assert.ElementsMatch(t, []string{"https://github.com/org/b.git", "https://github.com/org/c.git"}, cancelled)
+
+	for _, entry := range logs.All() {
+		assert.NotContains(t, entry.Message, testToken)
+		assert.NotContains(t, fmt.Sprint(entry.ContextMap()), testToken)
+	}
+}
+
+func TestInit_InvalidRepoErrorDoesNotLogToken(t *testing.T) {
+	const testToken = "ghp_TESTTOKENinvalidrepo1234567890"
+
+	// a repo from the config with a token in it and no repo name, so it fails
+	// to normalize and the error repeats the URL
+	s, conn := createTestSource(&sourcespb.GitHub{
+		Endpoint:     "https://api.github.com",
+		Credential:   &sourcespb.GitHub_Token{Token: "token"},
+		Repositories: []string{"https://" + testToken + "@github.com/org"},
+	})
+
+	ctx, logs := logtest.DebugContext()
+	assert.NoError(t, s.Init(ctx, "test - github", 0, 1337, false, conn, 1))
+
+	errLines := logs.FilterMessage("invalid repository").All()
+	if assert.Len(t, errLines, 1) {
+		fields := errLines[0].ContextMap()
+		assert.Equal(t, "https://github.com/org", fields["repo"])
+		assert.Contains(t, fields["error"], "missing the repo name")
+	}
+	for _, entry := range logs.All() {
+		assert.NotContains(t, entry.Message, testToken)
+		assert.NotContains(t, fmt.Sprint(entry.ContextMap()), testToken)
+	}
+}
+
+func TestAddReposForMembers_StopsOnCancel(t *testing.T) {
+	s := initTestSource(&sourcespb.GitHub{
+		Endpoint:   "https://api.github.com",
+		Credential: &sourcespb.GitHub_Token{Token: "token"},
+	})
+	s.memberCache = map[string]struct{}{"member1": {}, "member2": {}}
+
+	// cancel before the loop starts, so no member is fetched and no error is logged
+	debugCtx, logs := logtest.DebugContext()
+	ctx, cancel := context.WithCancel(debugCtx)
+	cancel()
+
+	s.addReposForMembers(ctx, noopReporter())
+
+	assert.Equal(t, 1, logs.FilterMessage("skipping remaining members").Len())
+	assert.Zero(t, logs.FilterLevelExact(zapcore.ErrorLevel).Len())
 }

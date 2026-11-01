@@ -2,17 +2,13 @@ package github
 
 import (
 	"fmt"
-	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 
-	"github.com/bradleyfalzon/ghinstallation/v2"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/google/go-github/v67/github"
 	"github.com/shurcooL/githubv4"
 
-	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/context"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/credentialspb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/sources/git"
@@ -22,23 +18,15 @@ type appConnector struct {
 	installationClient *github.Client
 	installationID     int64
 	appID              int64
-	appPrivateKey      []byte
 	apiEndpoint        string
+	appPrivateKey      string
 
 	mu sync.RWMutex
-	// clientsByInstallationID is scoped to this connector/source run and is
-	// bounded by the installations touched while scanning.
-	clientsByInstallationID map[int64]*appInstallationClients
 
 	// repoInstallationMap maps repo clone URLs to their owning installation
 	// ID for repos discovered from non-default installations. Clone checks
 	// this map to use the correct installation token.
 	repoInstallationMap map[string]int64
-}
-
-type appInstallationClients struct {
-	apiClient     *github.Client
-	graphqlClient *githubv4.Client
 }
 
 var _ Connector = (*appConnector)(nil)
@@ -47,13 +35,16 @@ const githubHTTPTimeoutSeconds = 60
 
 func NewAppConnector(ctx context.Context, apiEndpoint string, app *credentialspb.GitHubApp, scanAllInstallations bool) (Connector, error) {
 	var installationID int64
+	var err error
+
 	if app.InstallationId != "" {
-		var err error
 		installationID, err = strconv.ParseInt(app.InstallationId, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("could not parse app installation ID %q: %w", app.InstallationId, err)
 		}
-	} else if !scanAllInstallations {
+	}
+
+	if installationID == 0 && !scanAllInstallations {
 		return nil, fmt.Errorf("githubApp.installationId is required unless scanAllInstallations is set")
 	}
 
@@ -62,36 +53,28 @@ func NewAppConnector(ctx context.Context, apiEndpoint string, app *credentialspb
 		return nil, fmt.Errorf("could not parse app ID %q: %w", app.AppId, err)
 	}
 
-	installationTransport, err := newAppsTransport(apiEndpoint, appID, []byte(app.PrivateKey))
-	if err != nil {
-		return nil, fmt.Errorf("could not create installation client transport: %w", err)
-	}
-	installationClient, err := newGitHubClientWithTransport(apiEndpoint, installationTransport)
+	installationClient, err := GetAppClient(ctx, apiEndpoint, appID, app.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("could not create installation client: %w", err)
 	}
 
 	connector := &appConnector{
-		installationClient:      installationClient,
-		installationID:          installationID,
-		appID:                   appID,
-		appPrivateKey:           []byte(app.PrivateKey),
-		apiEndpoint:             apiEndpoint,
-		clientsByInstallationID: make(map[int64]*appInstallationClients),
-		repoInstallationMap:     make(map[string]int64),
+		installationClient:  installationClient,
+		installationID:      installationID,
+		appID:               appID,
+		apiEndpoint:         apiEndpoint,
+		appPrivateKey:       app.PrivateKey,
+		repoInstallationMap: make(map[string]int64),
 	}
 
 	// When no default installation is configured (installationID == 0, only
 	// possible with scanAllInstallations), installations are discovered and
 	// clients created lazily per-repo, so there is no default client to
 	// validate up front.
-	if installationID != 0 {
-		if _, err := connector.APIClientForInstallation(installationID); err != nil {
-			return nil, fmt.Errorf("could not create API client for configured installation: %w", err)
-		}
-
-		if _, err := connector.graphqlClientForInstallation(ctx, installationID); err != nil {
-			return nil, fmt.Errorf("error creating GraphQL client: %w", err)
+	if connector.HasDefaultInstallation() {
+		_, err := connector.clientsForInstallation(ctx, installationID)
+		if err != nil {
+			return nil, fmt.Errorf("could not create clients for configured installation: %w", err)
 		}
 	}
 
@@ -115,7 +98,7 @@ func (c *appConnector) HasDefaultInstallation() bool {
 // as a fallback client for repos/resources outside any installation listing
 // and call it unconditionally.
 func (c *appConnector) APIClient() *github.Client {
-	client, err := c.APIClientForInstallation(c.installationID)
+	client, err := c.APIClientForInstallation(contextForClientLookup(), c.installationID)
 	if err != nil {
 		return nil
 	}
@@ -124,7 +107,7 @@ func (c *appConnector) APIClient() *github.Client {
 
 func (c *appConnector) APIClientForRepo(repoURL string) (*github.Client, error) {
 	installID, _ := c.installationIDForRepo(repoURL)
-	return c.APIClientForInstallation(installID)
+	return c.APIClientForInstallation(contextForClientLookup(), installID)
 }
 
 func (c *appConnector) GraphQLClientForRepo(ctx context.Context, repoURL string) (*githubv4.Client, error) {
@@ -133,35 +116,12 @@ func (c *appConnector) GraphQLClientForRepo(ctx context.Context, repoURL string)
 }
 
 func (c *appConnector) graphqlClientForInstallation(ctx context.Context, installID int64) (*githubv4.Client, error) {
-	c.mu.RLock()
-	if clients := c.clientsByInstallationID[installID]; clients != nil && clients.graphqlClient != nil {
-		client := clients.graphqlClient
-		c.mu.RUnlock()
-		return client, nil
-	}
-	c.mu.RUnlock()
-
-	apiClient, err := c.APIClientForInstallation(installID)
-	if err != nil {
-		return nil, err
-	}
-	client, err := createGraphqlClient(ctx, apiClient.Client(), c.apiEndpoint)
+	clients, err := c.clientsForInstallation(ctx, installID)
 	if err != nil {
 		return nil, err
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	clients := c.clientsForInstallationLocked(installID)
-	if clients.graphqlClient != nil {
-		return clients.graphqlClient, nil
-	}
-	if clients.apiClient == nil {
-		clients.apiClient = apiClient
-	}
-	clients.graphqlClient = client
-	return client, nil
+	return clients.GraphQLClient, nil
 }
 
 func (c *appConnector) Clone(ctx context.Context, repoURL string, args ...string) (string, *gogit.Repository, error) {
@@ -176,20 +136,47 @@ func (c *appConnector) Clone(ctx context.Context, repoURL string, args ...string
 		return "", nil, fmt.Errorf("no GitHub App installation resolved for repo %q; set githubApp.installationId to a fallback installation to scan repos outside installation listings (e.g. member repos with scanUsers) together with scanAllInstallations", repoURL)
 	}
 
-	// TODO: Check rate limit for this call.
-	token, _, err := c.installationClient.Apps.CreateInstallationToken(
-		ctx,
-		installID,
-		&github.InstallationTokenOptions{})
+	cs, err := c.clientsForInstallation(ctx, installID)
 	if err != nil {
-		return "", nil, fmt.Errorf("could not create installation token for installation %d: %w", installID, err)
+		return "", nil, fmt.Errorf("cannot fetch installation clients for installation %d: %w", installID, err)
 	}
 
-	return git.CloneRepoUsingToken(ctx, token.GetToken(), repoURL, "", "x-access-token", true, args...)
+	token, err := cs.AccessToken(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("could not fetch installation access token for installation %d: %w", installID, err)
+	}
+
+	return git.CloneRepoUsingToken(ctx, token, repoURL, "", "x-access-token", true, args...)
+}
+
+// grantsForRepo returns what the installation that owns repoURL grants, for
+// the permissions the comment scan needs. Installation permissions apply to
+// every repo the installation can see, so repos on one installation share
+// the answer, and the cached token makes it free after the repo's clone.
+func (c *appConnector) grantsForRepo(ctx context.Context, repoURL string) (*installationGrants, error) {
+	installID, _ := c.installationIDForRepo(repoURL)
+	if installID == 0 {
+		return nil, fmt.Errorf("no GitHub App installation resolved for repo %q", repoURL)
+	}
+
+	cs, err := c.clientsForInstallation(ctx, installID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot fetch installation clients for installation %d: %w", installID, err)
+	}
+
+	perms, err := cs.GrantedPermissions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("could not read permissions for installation %d: %w", installID, err)
+	}
+	return newInstallationGrants(installID, perms), nil
 }
 
 // installationIDForRepo returns the mapped installation ID for repoURL. When no
 // mapping exists, it falls back to the configured installation and returns false.
+//
+// Note: Because ensureRepoInstallation also stores values in this map with
+// c.installationID, the second return value here is NOT indicative of using
+// the fallback.
 func (c *appConnector) installationIDForRepo(repoURL string) (int64, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -255,7 +242,7 @@ func (c *appConnector) setRepoInstallationForWiki(repoURL string, installationID
 // installation, lazily creating it if needed. See APIClient for why this
 // cannot simply return nil when no default installation is configured.
 func (c *appConnector) GraphQLClient() *githubv4.Client {
-	client, err := c.graphqlClientForInstallation(context.Background(), c.installationID)
+	client, err := c.graphqlClientForInstallation(contextForClientLookup(), c.installationID)
 	if err != nil {
 		return nil
 	}
@@ -270,99 +257,28 @@ func (c *appConnector) InstallationClient() *github.Client {
 // installation. This is needed when a GitHub App is installed across multiple
 // orgs — each org's API calls must use that org's installation token to get
 // proper IP allowlist bypass and permission scoping.
-func (c *appConnector) APIClientForInstallation(installationID int64) (*github.Client, error) {
-	c.mu.RLock()
-	if clients := c.clientsByInstallationID[installationID]; clients != nil && clients.apiClient != nil {
-		client := clients.apiClient
-		c.mu.RUnlock()
-		return client, nil
-	}
-	c.mu.RUnlock()
-
-	client, err := c.createAPIClientForInstallation(installationID)
+func (c *appConnector) APIClientForInstallation(ctx context.Context, installationID int64) (*github.Client, error) {
+	clients, err := c.clientsForInstallation(ctx, installationID)
 	if err != nil {
 		return nil, err
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	clients := c.clientsForInstallationLocked(installationID)
-	if clients.apiClient != nil {
-		return clients.apiClient, nil
-	}
-	clients.apiClient = client
-	return client, nil
+	return clients.APIClient, nil
 }
 
-func (c *appConnector) clientsForInstallationLocked(installationID int64) *appInstallationClients {
-	clients := c.clientsByInstallationID[installationID]
-	if clients == nil {
-		clients = &appInstallationClients{}
-		c.clientsByInstallationID[installationID] = clients
-	}
-	return clients
+func (c *appConnector) clientsForInstallation(ctx context.Context, installationID int64) (*AppInstallationClients, error) {
+	return GetAppInstallationClients(ctx, c.apiEndpoint, c.appID, c.appPrivateKey, installationID)
 }
 
-func (c *appConnector) createAPIClientForInstallation(installationID int64) (*github.Client, error) {
-	appsTransport, err := newAppsTransport(c.apiEndpoint, c.appID, c.appPrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("could not create app transport for installation %d: %w", installationID, err)
-	}
-
-	// NewFromAppsTransport inherits BaseURL from appsTransport, which
-	// newAppsTransport already set correctly (incl. GHE.com). Don't override it
-	// with the raw endpoint here or GHE.com token refresh would 401.
-	transport := ghinstallation.NewFromAppsTransport(appsTransport, installationID)
-
-	client, err := newGitHubClientWithTransport(c.apiEndpoint, transport)
-	if err != nil {
-		return nil, fmt.Errorf("could not create API client for installation %d: %w", installationID, err)
-	}
-	return client, nil
-}
-
-func newAppsTransport(apiEndpoint string, appID int64, privateKey []byte) (*ghinstallation.AppsTransport, error) {
-	httpClient := common.RetryableHTTPClientTimeout(githubHTTPTimeoutSeconds)
-	appsTransport, err := ghinstallation.NewAppsTransport(httpClient.Transport, appID, privateKey)
-	if err != nil {
-		return nil, err
-	}
-
-	// ghinstallation uses BaseURL to build the token exchange URL
-	// {BaseURL}/app/installations/{id}/access_tokens. For GHE.com this must be
-	// the api.SUBDOMAIN.ghe.com base with no /api/v3 and no trailing slash
-	// (which ghinstallation does not expect), otherwise token refresh 401s.
-	baseURL, err := appsBaseURL(apiEndpoint)
-	if err != nil {
-		return nil, err
-	}
-	appsTransport.BaseURL = baseURL
-	return appsTransport, nil
-}
-
-// appsBaseURL returns the BaseURL that ghinstallation transports should use for
-// token exchange/refresh. For GHE.com it resolves to the api.* subdomain with
-// the trailing slash trimmed; for github.com and GHES it is the endpoint as-is.
-func appsBaseURL(apiEndpoint string) (string, error) {
-	if isGHECloud(apiEndpoint) {
-		normalizedURL, err := normalizeGHECloudAPIEndpoint(apiEndpoint)
-		if err != nil {
-			return "", fmt.Errorf("could not normalize GHE.com endpoint: %w", err)
-		}
-		return strings.TrimRight(normalizedURL, "/"), nil
-	}
-	return apiEndpoint, nil
-}
-
-func newGitHubClientWithTransport(apiEndpoint string, transport http.RoundTripper) (*github.Client, error) {
-	httpClient := common.RetryableHTTPClientTimeout(githubHTTPTimeoutSeconds)
-	httpClient.Transport = transport
-
-	// GHE.com (GHEC with data residency) serves its REST API at the root of
-	// api.SUBDOMAIN.ghe.com (like api.github.com), NOT under the GHES /api/v3 path.
-	if isGHECloud(apiEndpoint) {
-		return createGHECloudClient(httpClient, apiEndpoint)
-	}
-	return github.NewClient(httpClient).WithEnterpriseURLs(apiEndpoint, apiEndpoint)
+// contextForClientLookup is only for the Connector methods that don't take a
+// context: APIClient, APIClientForRepo and GraphQLClient. They only build a
+// client or take it from the cache, which makes no network call. On a cache
+// miss, though, the "Creating GraphQL client" line is logged without the
+// source fields and ignores per-source debug. The fix is to pass a context
+// through the Connector interface, which is left for a separate change since
+// it touches every connector and its callers. Everything else passes its own
+// context. That is why the semgrep rule against new contexts is turned off on
+// this line.
+func contextForClientLookup() context.Context {
+	return context.Background() // nosemgrep
 }
