@@ -25,6 +25,7 @@ import (
 	"github.com/trufflesecurity/trufflehog/v3/pkg/context"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/decoders"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/detectors"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/detectors/verifierauth"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/engine/ahocorasick"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/engine/defaults"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/giturl"
@@ -43,6 +44,8 @@ var errOverlap = errors.New(
 	"more than one detector has found this result; for your safety, verification has been disabled. " +
 		"You can override this behavior by using the --allow-verification-overlap flag",
 )
+
+var errDetectorPanic = errors.New("detector panicked")
 
 // Metrics for the scan engine for external consumption.
 type Metrics struct {
@@ -111,6 +114,15 @@ type Config struct {
 	CustomVerifiersOnly           bool
 	VerifierEndpoints             map[string]string
 
+	// VerifierAuth authenticates verification requests to custom verifier
+	// endpoints that sit behind an auth proxy. It is keyed like the parsed
+	// VerifierEndpoints, and every entry must have a matching
+	// VerifierEndpoints entry: auth only ever applies to configured
+	// endpoints. Detectors receive it through VerifierAuthCustomizer and
+	// attach the token inside their own HTTP client, so verification still
+	// runs through each detector's FromData.
+	VerifierAuth map[config.DetectorID]*verifierauth.Config
+
 	// Verify determines whether the scanner will verify candidate secrets.
 	Verify bool
 
@@ -169,6 +181,9 @@ type Config struct {
 	// 1 = single pass (no chaining), 2+ = chained (e.g., base64 inside UTF-16).
 	// Default: 5.
 	MaxDecodeDepth int
+
+	// Max size of the deduplication LRU cache
+	DedupeCacheSize int
 }
 
 // Engine represents the core scanning engine responsible for detecting secrets in input data.
@@ -242,6 +257,8 @@ type Engine struct {
 
 	maxDecodeDepth int
 
+	dedupeCacheSize int
+
 	// runtimeCollector exposes live channel/worker/scan counters to Prometheus
 	// while the engine is running. Set in Start, cleared in Finish.
 	runtimeCollector *runtimeCollector
@@ -271,6 +288,7 @@ func NewEngine(ctx context.Context, cfg *Config) (*Engine, error) {
 		notificationWorkerMultiplier:        cfg.NotificationWorkerMultiplier,
 		verificationOverlapWorkerMultiplier: cfg.VerificationOverlapWorkerMultiplier,
 		maxDecodeDepth:                      cfg.MaxDecodeDepth,
+		dedupeCacheSize:                     cfg.DedupeCacheSize,
 	}
 	if engine.sourceManager == nil {
 		return nil, fmt.Errorf("source manager is required")
@@ -306,6 +324,12 @@ func NewEngine(ctx context.Context, cfg *Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Auth misconfiguration is checked before any filter runs, because a
+	// filter can only keep or drop a detector. Dropping a detector whose auth
+	// can't be applied would silently remove it from the scan.
+	if err := validateVerifierAuth(cfg.VerifierAuth, detectorsWithCustomVerifierEndpoints); err != nil {
+		return nil, err
+	}
 	if len(detectorsWithCustomVerifierEndpoints) > 0 {
 		filters = append(filters, func(d detectors.Detector) bool {
 			urls, ok := getWithDetectorID(d, detectorsWithCustomVerifierEndpoints)
@@ -324,6 +348,17 @@ func NewEngine(ctx context.Context, cfg *Config) (*Engine, error) {
 
 			if err := customizer.SetConfiguredEndpoints(urls...); err != nil {
 				return false
+			}
+
+			// validateVerifierAuth has already confirmed this detector type
+			// supports auth, so the type assertion only fails for a detector
+			// instance that diverges from its registered default.
+			if authCfg, ok := getWithDetectorID(d, cfg.VerifierAuth); ok && authCfg != nil {
+				authCustomizer, ok := d.(detectors.VerifierAuthCustomizer)
+				if !ok {
+					return false
+				}
+				authCustomizer.SetVerifierAuth(authCfg)
 			}
 
 			return true
@@ -453,6 +488,30 @@ func parseCustomVerifierEndpoints(endpoints map[string]string) (map[config.Detec
 	return customVerifierEndpoints, nil
 }
 
+// validateVerifierAuth rejects verifier auth that could not take effect:
+// auth for a detector with no custom verifier endpoints (auth only ever
+// applies to configured endpoints) and auth for a detector type that cannot
+// accept it. Either would otherwise send requests to the auth proxy without
+// the token, which typically reads as every secret being unverified.
+func validateVerifierAuth(auth map[config.DetectorID]*verifierauth.Config, endpoints map[config.DetectorID][]string) error {
+	if len(auth) == 0 {
+		return nil
+	}
+	supportsAuth := defaults.DefaultDetectorTypesImplementing[detectors.VerifierAuthCustomizer]()
+	for id, authCfg := range auth {
+		if authCfg == nil {
+			continue
+		}
+		if _, ok := endpoints[id]; !ok {
+			return fmt.Errorf("verifier auth configured for detector %q without custom verifier endpoints", id.String())
+		}
+		if _, ok := supportsAuth[id.ID]; !ok {
+			return fmt.Errorf("verifier auth configured for detector %q, which does not support verifier auth", id.String())
+		}
+	}
+	return nil
+}
+
 // detectorTypeToSet is a helper function to convert a slice of detector IDs into a set.
 func detectorTypeToSet(detectors []config.DetectorID) map[config.DetectorID]struct{} {
 	out := make(map[config.DetectorID]struct{}, len(detectors))
@@ -518,14 +577,15 @@ func filterDetectors(filterFunc func(detectors.Detector) bool, input []detectors
 // deduplication efforts, allowing the engine to quickly check if a chunk has
 // been processed before, thereby saving computational overhead.
 func (e *Engine) initialize(ctx context.Context) error {
-	// The cache size is set to 5000 entries, which is a balance between memory usage and the need for effective deduplication.
-	// Since the cache entries are md5 hashes so each entry would be 16 bytes, so in total this would be aorund 80KB of memory usage.
-	const cacheSize = 5000
+	if e.dedupeCacheEnabled() {
+		cache, err := lru.New[string, struct{}](e.dedupeCacheSize)
+		if err != nil {
+			return fmt.Errorf("failed to initialize LRU cache: %w", err)
+		}
 
-	cache, err := lru.New[string, struct{}](cacheSize)
-	if err != nil {
-		return fmt.Errorf("failed to initialize LRU cache: %w", err)
+		e.dedupeCache = cache
 	}
+
 	const (
 		// detectableChunksChanMultiplier is set to accommodate a high number of concurrent worker goroutines.
 		// This multiplier ensures that the detectableChunksChan channel has sufficient buffer capacity
@@ -549,7 +609,6 @@ func (e *Engine) initialize(ctx context.Context) error {
 		chan verificationOverlapChunk, defaultChannelBuffer*verificationOverlapChunksChanMultiplier,
 	)
 	e.results = make(chan detectors.ResultWithMetadata, defaultChannelBuffer*resultsChanMultiplier)
-	e.dedupeCache = cache
 	ctx.Logger().V(4).Info("engine initialized")
 
 	// Configure the EntireChunkSpanCalculator if the engine is set to scan the entire chunk.
@@ -563,6 +622,10 @@ func (e *Engine) initialize(ctx context.Context) error {
 	ctx.Logger().V(4).Info("set up aho-corasick core")
 
 	return nil
+}
+
+func (e *Engine) dedupeCacheEnabled() bool {
+	return e.dedupeCacheSize > 0
 }
 
 const ignoreTag = "trufflehog:ignore"
@@ -1014,115 +1077,133 @@ func likelyDuplicate(ctx context.Context, val chunkSecretKey, dupes map[chunkSec
 func (e *Engine) verificationOverlapWorker(ctx context.Context) {
 	var wgDetect sync.WaitGroup
 
-	// Reuse the same map and slice to avoid allocations.
+	for chunk := range e.verificationOverlapChunksChan {
+		e.processVerificationOverlapChunk(ctx, chunk, &wgDetect)
+	}
+
+	wgDetect.Wait()
+}
+
+func (e *Engine) processVerificationOverlapChunk(
+	ctx context.Context,
+	chunk verificationOverlapChunk,
+	wgDetect *sync.WaitGroup,
+) {
+	sourceTypeStr := chunk.chunk.SourceType.String()
+
+	defer chunk.verificationOverlapWgDoneFn()
+	defer common.RecoverWithHandler(ctx, func(error) {
+		chunksDropped.WithLabelValues("verification_overlap", "panic", sourceTypeStr).Inc()
+	})
+
 	const avgSecretsPerDetector = 8
 	detectorKeysWithResults := make(map[ahocorasick.DetectorKey]*ahocorasick.DetectorMatch, avgSecretsPerDetector)
 	chunkSecrets := make(map[chunkSecretKey]struct{}, avgSecretsPerDetector)
 
-	for chunk := range e.verificationOverlapChunksChan {
-		sourceTypeStr := chunk.chunk.SourceType.String()
-		chunksEnteredStage.WithLabelValues("verification_overlap", sourceTypeStr).Inc()
-		for _, detector := range chunk.detectors {
-			isFalsePositive := detectors.GetFalsePositiveCheck(detector.Detector)
-			detectorNameStr := detector.Key.Type().String()
+	chunksEnteredStage.WithLabelValues("verification_overlap", sourceTypeStr).Inc()
+	for _, detector := range chunk.detectors {
+		isFalsePositive := detectors.GetFalsePositiveCheck(detector.Detector)
+		detectorNameStr := detector.Key.Type().String()
 
-			// DO NOT VERIFY at this stage of the pipeline.
-			matchedBytes := detector.Matches()
-			for _, match := range matchedBytes {
-				ctx, cancel := context.WithTimeout(ctx, time.Second*2)
-				results, err := detector.FromData(ctx, false, match)
-				cancel()
-				if err != nil {
-					ctx.Logger().Error(
-						err, "error finding results in chunk during verification overlap",
-						"detector", detectorNameStr,
-					)
-					chunksDropped.WithLabelValues("verification_overlap", "detector_error", sourceTypeStr).Inc()
+		// DO NOT VERIFY at this stage of the pipeline.
+		matchedBytes := detector.Matches()
+		for _, match := range matchedBytes {
+			ctx, cancel := context.WithTimeout(context.WithValue(ctx, "detector", detectorNameStr), time.Second*2)
+			results, err := fromDataWithoutVerifyRecoveringPanic(ctx, detector.Detector, match)
+			cancel()
+			if err != nil {
+				if !errors.Is(err, errDetectorPanic) {
+					ctx.Logger().Error(err, "error finding results in chunk during verification overlap")
+				}
+				chunksDropped.WithLabelValues("verification_overlap", "detector_error", sourceTypeStr).Inc()
+			}
+
+			if len(results) == 0 {
+				continue
+			}
+			if _, ok := detectorKeysWithResults[detector.Key]; !ok {
+				detectorKeysWithResults[detector.Key] = detector
+			}
+
+			// If results filtration eliminates a rotated secret, then that rotation will never be reported. This
+			// problem can theoretically occur for any scan, but we've only actually seen it in practice during
+			// targeted scans. (The reason for this discrepancy is unclear.) The simplest fix is therefore to
+			// disable filtration for targeted scans, but if you're here because this problem surfaced for a
+			// non-targeted scan then we'll have to solve it correctly.
+			if chunk.chunk.SecretID == 0 {
+				results = e.filterResults(ctx, "verification_overlap", detector, results)
+			}
+
+			for _, res := range results {
+				var val []byte
+				if res.RawV2 != nil {
+					val = res.RawV2
+				} else {
+					val = res.Raw
 				}
 
-				if len(results) == 0 {
+				// Use levenstein distance to determine if the secret is likely the same.
+				// Ex:
+				// - postman api key: PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
+				// - malicious detector "api key": qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
+				key := chunkSecretKey{secret: string(val), detectorKey: detector.Key}
+				if _, ok := chunkSecrets[key]; ok {
+					resultsDropped.WithLabelValues("verification_overlap", "intra_chunk_duplicate", detectorNameStr).Inc()
 					continue
 				}
-				if _, ok := detectorKeysWithResults[detector.Key]; !ok {
-					detectorKeysWithResults[detector.Key] = detector
-				}
 
-				// If results filtration eliminates a rotated secret, then that rotation will never be reported. This
-				// problem can theoretically occur for any scan, but we've only actually seen it in practice during
-				// targeted scans. (The reason for this discrepancy is unclear.) The simplest fix is therefore to
-				// disable filtration for targeted scans, but if you're here because this problem surfaced for a
-				// non-targeted scan then we'll have to solve it correctly.
-				if chunk.chunk.SecretID == 0 {
-					results = e.filterResults(ctx, "verification_overlap", detector, results)
-				}
-
-				for _, res := range results {
-					var val []byte
-					if res.RawV2 != nil {
-						val = res.RawV2
-					} else {
-						val = res.Raw
+				if likelyDuplicate(ctx, key, chunkSecrets) {
+					// This indicates that the same secret was found by multiple detectors.
+					// We should NOT VERIFY this chunk's data.
+					if e.verificationOverlapTracker != nil {
+						e.verificationOverlapTracker.Add(1)
 					}
+					// The overlap error stays the verdict; VerificationSkipped additionally records that no
+					// verifier ran, so consumers counting verifier outcomes don't read errOverlap as a provider
+					// failure.
+					res.VerificationSkipped = true
+					res.SetVerificationError(errOverlap)
+					e.processResult(
+						ctx,
+						res,
+						chunk.chunk,
+						chunk.decoder,
+						detector.Description(),
+						isFalsePositive,
+					)
 
-					// Use levenstein distance to determine if the secret is likely the same.
-					// Ex:
-					// - postman api key: PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
-					// - malicious detector "api key": qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
-					key := chunkSecretKey{secret: string(val), detectorKey: detector.Key}
-					if _, ok := chunkSecrets[key]; ok {
-						resultsDropped.WithLabelValues("verification_overlap", "intra_chunk_duplicate", detectorNameStr).Inc()
-						continue
-					}
-
-					if likelyDuplicate(ctx, key, chunkSecrets) {
-						// This indicates that the same secret was found by multiple detectors.
-						// We should NOT VERIFY this chunk's data.
-						if e.verificationOverlapTracker != nil {
-							e.verificationOverlapTracker.Add(1)
-						}
-						res.SetVerificationError(errOverlap)
-						e.processResult(
-							ctx,
-							res,
-							chunk.chunk,
-							chunk.decoder,
-							detector.Description(),
-							isFalsePositive,
-						)
-
-						// Remove the detector key from the list of detector keys with results.
-						// This is to ensure that the chunk is not reprocessed with verification enabled
-						// for this detector.
-						delete(detectorKeysWithResults, detector.Key)
-					}
-					chunkSecrets[key] = struct{}{}
+					// Remove the detector key from the list of detector keys with results.
+					// This is to ensure that the chunk is not reprocessed with verification enabled
+					// for this detector.
+					delete(detectorKeysWithResults, detector.Key)
 				}
+				chunkSecrets[key] = struct{}{}
 			}
 		}
-
-		for _, detector := range detectorKeysWithResults {
-			wgDetect.Add(1)
-			e.detectableChunksChan <- detectableChunk{
-				chunk:    chunk.chunk,
-				detector: detector,
-				decoder:  chunk.decoder,
-				verify:   e.shouldVerifyChunk(chunk.chunk.SourceVerify, detector, e.detectorVerificationOverrides),
-				wgDoneFn: wgDetect.Done,
-			}
-		}
-
-		// Empty the dupes and detectors slice
-		for k := range chunkSecrets {
-			delete(chunkSecrets, k)
-		}
-		for k := range detectorKeysWithResults {
-			delete(detectorKeysWithResults, k)
-		}
-
-		chunk.verificationOverlapWgDoneFn()
 	}
 
-	wgDetect.Wait()
+	for _, detector := range detectorKeysWithResults {
+		verify := e.shouldVerifyChunk(chunk.chunk.SourceVerify, detector, e.detectorVerificationOverrides)
+		wgDetect.Add(1)
+		e.detectableChunksChan <- detectableChunk{
+			chunk:    chunk.chunk,
+			detector: detector,
+			decoder:  chunk.decoder,
+			verify:   verify,
+			wgDoneFn: wgDetect.Done,
+		}
+	}
+}
+
+func fromDataWithoutVerifyRecoveringPanic(
+	ctx context.Context,
+	d detectors.Detector,
+	data []byte,
+) (results []detectors.Result, err error) {
+	defer common.RecoverWithHandler(ctx, func(panicErr error) {
+		err = fmt.Errorf("%w: %w", errDetectorPanic, panicErr)
+	})
+	return d.FromData(ctx, false, data)
 }
 
 func (e *Engine) detectorWorker(ctx context.Context) {
@@ -1134,6 +1215,10 @@ func (e *Engine) detectorWorker(ctx context.Context) {
 }
 
 func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
+	// start feeds only the printAvgDetectorTime report, so it is left at its zero value when that option is off and
+	// must not be read outside that report's code. It is taken once per chunk, so each duration the report records
+	// spans every match processed so far. detectorExecutionDuration times each match on its own instead; see
+	// matchStart below.
 	var start time.Time
 	if e.printAvgDetectorTime {
 		start = time.Now()
@@ -1170,12 +1255,16 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 		t := time.AfterFunc(detectionTimeout+1*time.Second, func() {
 			ctx.Logger().Error(nil, "a detector ignored the context timeout")
 		})
+		// detectorExecutionDuration covers one detector run, which is this single FromData call, so it is timed here
+		// regardless of printAvgDetectorTime.
+		matchStart := time.Now()
 		results, err := e.verificationCache.FromData(
 			ctx,
 			data.detector.Detector,
 			data.verify,
 			data.chunk.SecretID != 0,
 			matchBytes)
+		matchElapsed := time.Since(matchStart)
 		t.Stop()
 		cancel()
 		if err != nil {
@@ -1188,6 +1277,15 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 			resultsProduced.WithLabelValues(detectorNameStr).Add(float64(len(results)))
 		}
 
+		// With verification disabled for this chunk and detector, results carry whatever verdict the detector assigned
+		// without contacting the provider (normally unverified). Leave that verdict untouched and only record that the
+		// verifier never ran. Verifying paths, including cache hits, leave VerificationSkipped false.
+		if !data.verify {
+			for i := range results {
+				results[i].VerificationSkipped = true
+			}
+		}
+
 		detectorExecutionCount.WithLabelValues(
 			detectorNameStr,
 			sourceTypeStr,
@@ -1195,7 +1293,7 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 		).Inc()
 		detectorExecutionDuration.WithLabelValues(
 			detectorNameStr,
-		).Observe(float64(time.Since(start).Milliseconds()))
+		).Observe(float64(matchElapsed.Milliseconds()))
 
 		if e.printAvgDetectorTime && len(results) > 0 {
 			elapsed := time.Since(start)
@@ -1357,14 +1455,15 @@ func (e *Engine) notifierWorker(ctx context.Context) {
 		// This deduplication only applies to results that are *not*
 		// from reverification, since we are expected to see the same
 		// result from reverification and want to Dispatch it below.
-		if result.SecretID == 0 {
+
+		// Notifier workers share this cache; the check and insert must be one atomic step.
+		if e.dedupeCacheEnabled() && result.SecretID == 0 {
 			h := md5.Sum([]byte(fmt.Sprintf("%s%s%s%s%+v", result.DetectorName, result.DetectorType.String(), result.Raw, result.RawV2, result.SourceMetadata)))
 			key := string(h[:])
-			if _, ok := e.dedupeCache.Get(key); ok {
+			if found, _ := e.dedupeCache.ContainsOrAdd(key, struct{}{}); found {
 				resultsDropped.WithLabelValues("notifier", "dedupe_cache_hit", detectorNameStr).Inc()
 				continue
 			}
-			e.dedupeCache.Add(key, struct{}{})
 		}
 
 		if result.Verified {

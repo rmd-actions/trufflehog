@@ -74,6 +74,15 @@ func (r *JobProgressRef) Err() error {
 	return r.jobProgress.Err()
 }
 
+// UnitProgress returns the progress the source last reported inside the unit
+// with the provided ID, and whether it reported any.
+func (r *JobProgressRef) UnitProgress(unitID string) (UnitProgress, bool) {
+	if r.jobProgress == nil {
+		return UnitProgress{}, false
+	}
+	return r.jobProgress.UnitProgress(unitID)
+}
+
 // Done returns a channel that will block until the job has completed.
 func (r *JobProgressRef) Done() <-chan struct{} {
 	if r.jobProgress == nil {
@@ -104,12 +113,38 @@ func (r *JobProgressRef) CancelRun(cause error) {
 }
 
 // Fatal is a wrapper around error to differentiate non-fatal errors from fatal
-// ones. A fatal error is typically from a finished context or any error
-// returned from a source's Init, Chunks, Enumerate, or ChunkUnit methods.
+// ones. A fatal error is one that leads to a complete failure of job,
+// typically indicated by an error from a source's Init, Chunks, Enumerate, or
+// ChunkUnit methods.
 type Fatal struct{ error }
 
 func (f Fatal) Error() string { return fmt.Sprintf("fatal: %s", f.error.Error()) }
 func (f Fatal) Unwrap() error { return f.error }
+
+// Interrupt is a wrapper around error to indicate a job ended early without
+// failing, typically because its context was cancelled, such as by CancelRun.
+type Interrupt struct{ error }
+
+func (i Interrupt) Error() string { return fmt.Sprintf("interrupted: %s", i.error.Error()) }
+func (i Interrupt) Unwrap() error { return i.error }
+
+// UserActionable is a wrapper around error to indicate a user can resolve it,
+// for example by fixing credentials or granting access. It does not determine
+// whether the error is fatal: a source can return it to fail the job, or
+// report it and continue scanning.
+type UserActionable struct{ error }
+
+// NewUserActionableError wraps err to mark it as resolvable by a user. It returns
+// nil if err is nil.
+func NewUserActionableError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return UserActionable{err}
+}
+
+func (u UserActionable) Error() string { return u.error.Error() }
+func (u UserActionable) Unwrap() error { return u.error }
 
 // ChunkError is a custom error type for errors encountered during chunking of
 // a specific unit.
@@ -336,6 +371,19 @@ func (jp *JobProgress) Snapshot() JobProgressMetrics {
 	return metrics
 }
 
+// UnitProgress safely gets the progress the source last reported inside the
+// unit with the provided ID.
+func (jp *JobProgress) UnitProgress(unitID string) (UnitProgress, bool) {
+	jp.metricsLock.Lock()
+	progress := jp.progress
+	jp.metricsLock.Unlock()
+
+	if progress == nil {
+		return UnitProgress{}, false
+	}
+	return progress.GetUnitProgressFor(unitID)
+}
+
 // ReportError adds a non-nil error to the aggregate of errors
 // encountered during scanning.
 func (jp *JobProgress) ReportError(err error) {
@@ -398,6 +446,17 @@ func (m JobProgressMetrics) FatalErrors() error {
 		}
 	}
 	return errors.Join(aggregate...)
+}
+
+// InterruptError returns the first Interrupt error, if any, encountered in the
+// scan.
+func (m JobProgressMetrics) InterruptError() error {
+	for _, err := range m.Errors {
+		if interruptErr, found := errors.AsType[Interrupt](err); found {
+			return interruptErr
+		}
+	}
+	return nil
 }
 
 func (m JobProgressMetrics) PercentComplete() int {
