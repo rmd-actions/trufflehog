@@ -1,6 +1,8 @@
 package detectors
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -8,9 +10,11 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"unicode"
 
+	"github.com/trufflesecurity/trufflehog/v3/pkg/detectors/verifierauth"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/detector_typepb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/detectorspb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/source_metadatapb"
@@ -92,6 +96,15 @@ type EndpointCustomizer interface {
 	UseFoundEndpoints(bool)
 }
 
+// VerifierAuthCustomizer is an optional interface for detectors whose
+// configured verification endpoints sit behind an auth proxy. It is separate
+// from EndpointCustomizer so existing implementers are unaffected; detectors
+// that embed EndpointSetter get it for free, and route their verification
+// requests through EndpointSetter.VerificationClient to apply it.
+type VerifierAuthCustomizer interface {
+	SetVerifierAuth(*verifierauth.Config)
+}
+
 type CloudProvider interface {
 	CloudEndpoint() string
 }
@@ -106,6 +119,14 @@ type Result struct {
 	// VerificationFromCache indicates whether this result's verification result came from the verification cache rather
 	// than an actual remote request.
 	VerificationFromCache bool
+	// VerificationSkipped indicates that the engine produced this result without attempting remote verification,
+	// either because verification was disabled for the result's source or detector, or because the engine withheld
+	// verification after multiple detectors matched the same secret. It lets consumers that measure verifier activity
+	// tell "the verifier did not run" apart from "the verifier ran and the credential did not verify". It is purely
+	// informational: Verified and the verification error keep whatever the detector or engine assigned, so a skipped
+	// result still reports as unverified (or with an overlap verification error) exactly as it would without this
+	// field.
+	VerificationSkipped bool
 	// Raw contains the raw secret identifier data. Prefer IDs over secrets since it is used for deduping after hashing.
 	Raw []byte
 	// RawV2 contains the raw secret identifier that is a combination of both the ID and the secret.
@@ -278,12 +299,29 @@ func CopyMetadata(chunk *sources.Chunk, result Result) ResultWithMetadata {
 	}
 }
 
+// SortResults stably orders results by Redacted, then RawV2, then Raw. Detectors that build results from a map return
+// them in random order; callers that select results by position (CleanResults, and engine.filterResults on behalf of
+// custom cleaners) sort first so the survivors do not change between scans.
+// Results that tie on all three fields can still differ in other fields, so the sort is stable: tied results keep
+// their input order. The output is fully deterministic only if that input order is consistent.
+func SortResults(results []Result) {
+	slices.SortStableFunc(results, func(a, b Result) int {
+		return cmp.Or(
+			cmp.Compare(a.Redacted, b.Redacted),
+			bytes.Compare(a.RawV2, b.RawV2),
+			bytes.Compare(a.Raw, b.Raw),
+		)
+	})
+}
+
 // CleanResults returns all verified secrets, and if there are no verified secrets,
 // just one unverified secret if there are any.
 func CleanResults(results []Result, _ bool) []Result {
 	if len(results) == 0 {
 		return results
 	}
+	// Sort before selecting so that both the single unverified survivor and the verified set come out in a fixed order.
+	SortResults(results)
 
 	var cleaned = make(map[string]Result, 0)
 
@@ -301,6 +339,7 @@ func CleanResults(results []Result, _ bool) []Result {
 	for _, r := range cleaned {
 		results = append(results, r)
 	}
+	SortResults(results)
 
 	return results
 }
